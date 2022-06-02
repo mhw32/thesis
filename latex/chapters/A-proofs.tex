@@ -1,0 +1,199 @@
+\section{Chapter~\ref{chapter:mvae}}
+\label{sec:proof:mvae}
+
+\subsubsection{Product of a Finite Number of Gaussians}
+In this section, we provide the derivation for the parameters of a product of Gaussian experts (PoE). Derivation is summarized from \cite{bromiley2003products}.
+
+\begin{lem}
+Give a finite number $N$ of multi-dimensional Gaussian distributions $p_{i}(x)$ with mean $\mu_{i}$, covariance $V_{i}$ for $i = 1, ..., N$, the product $\prod_{i=1}^{N} p_{i}(x)$ is itself Gaussian with mean $(\sum_{i=1}^{N} T_{i}\mu_{i})(\sum_{i=1}^{N} T_{i})^{-1}$ and covariance $(\sum_{i=1}^{N} T_{i})^{-1}$ where $T_i = V_{i}^{-1}$.
+\end{lem}
+
+\begin{proof} We write the density of a Gaussian distribution in canonical form as \[K\exp\{\eta^{T}x - \frac{1}{2}x^{T}\Lambda x\}\] where $K$ is a normalizing constant, $\Lambda = V^{-1}$, $\eta = V^{-1}\mu$. We then write the product of $N$ Gaussians distributions \[\prod_{i=1}^{N} p_i \propto \exp\{(\sum_{i=1}^{N} \eta_i)^{T}x - \frac{1}{2}x^{T}(\sum_{i=1}^{N} \Lambda_{i})x\}.\] We note that this product itself has the form of a Gaussian distribution with $\eta = \sum_{i=1}^{N} \eta_i$ and $\Lambda = \sum_{i=1}^{N}\Lambda_i$. Converting back from canonical form, the product Gaussian has mean $\mu = (\sum_{i=1}^{N} T_{i}\mu_{i})(\sum_{i=1}^{N} T_{i})^{-1}$ and covariance $V = (\sum_{i=1}^{N} T_{i})^{-1}$.
+\end{proof}
+
+\subsubsection{Quotient of Two Gaussians}
+Similarly, we may derive the form of a quotient of two Gaussian distributions (QoE).
+
+\begin{lem}
+Give two Gaussian distributions $p(x)$ and $q(x)$ with mean $\mu_{p}$ and $\mu_{q}$, and covariance $V_{p}$ and $V_{q}$ respectively, the quotient $\frac{p(x)}{q(x)}$ is itself Gaussian with mean $(T_{p}\mu_{p} - T_{q}\mu_{q})(T_{p} - T_{q})^{-1}$ and covariance $(T_{p} - T_{q})^{-1}$ where $T_i(x) = V_{i}^{-1}(x)$.
+\end{lem}
+
+\begin{proof} We again write the density of a Gaussian distribution as \[K \exp\{\eta^{T}x - \frac{1}{2}x^{T}\Lambda x\}.\] We then write the quotient of two Gaussians $p$ and $q$ as \[\frac{K_p\exp\{\eta^{T}_{p}x - \frac{1}{2}x^{T}\Lambda_{p}x\}}{K_q\exp\{\eta^{T}_{q}x - \frac{1}{2}x^{T}\Lambda_{q}x\}} \propto \exp\{(\eta_{p} - \eta_{q})^{T}x - \frac{1}{2}x^{T}(\Lambda_{p} - \Lambda_q)x\}.\] This defines a new Gaussian distribution with $\Lambda = V_{p}^{-1} - V_{q}^{-1}$ and $\eta = V_{p}^{-1}\mu_{p} - V_{q}^{-1}\mu_{q}$. If we let $T_p = V_{p}^{-1}$ and $T_q = V_{q}^{-1}$, then we see that $V = \Lambda^{-1} = (T_p - T_q)^{-1}$ and $\mu = \eta V^{-1} = (T_p\mu_p - T_q\mu_q)(T_p - T_q)^{-1}$.
+\end{proof}
+
+The QoE suggests that the constraint $T_p > T_q \Rightarrow V_{p}^{-1} > V_{q}^{-1}$ must hold for the resulting Gaussian to be well-defined. In our experiments, $p$ is usually a product of Gaussians, and $q$ is a product of prior Gaussians (see Eqn 3 in main paper). Given $N$ modalities, we can decompose $V_p = \sum_{i=1}^{N} V_{i}^{-1}$ and $V_q = \sum_{i=1}^{N - 1} 1 = N-1$ where the prior is a unit Gaussian with variance 1. Thus, the constraint can be rewritten as $\sum_{i=1}^{N} V_{i}^{-1} > N - 1$, which is satisfied if $V_{i} > \frac{N}{N-1}, i=1, ..., N$. One benefit of using the regularized importance distribution $q(z|x)p(z)$ is to remove the need for this constraint. To fit MVAE without a universal expert, we add an additional nonlinearity to each inference network such that the variance is fed into a rescaled sigmoid: $V = \frac{N}{N-1} \cdot \text{sigm}(V)$.
+
+\section{Chapter~\ref{chapter:antivae}}
+\label{sec:proof:anti}
+
+In this section, we provide more rigor in proving (1) properties of antithetic samplers using Marsaglia's method and (2) properties of Marsaglia's method itself. In particular, we provide the proof of Proposition 1 (from the main text).
+
+\subsubsection{Properties of Antithetic Sampling}
+
+\begin{theorem} Let $p(x)$ be a distribution over $\mathbf{R}$ and let $p(\zeta) = \prod_i^k p(x_i)$ be the distribution of $k$ i.i.d.~samples. Let $T: \mathbf{R}^k \rightarrow \mathbf{R}^l$ be a ($l$-dimensional) statistic of $\zeta$. Let $s(t)$ be the induced distribution of this statistic:  \[s(t) = \int_\zeta \delta_{T(\zeta){=}t} p(\zeta)d\zeta.\]
+Let $F: \mathbf{R}^l \rightarrow \mathbf{R}^l$ be a deterministic function such that $s(F(t)) = s(t)$.
+We now construct a sample $\bar{\zeta}$ by: sampling $\zeta \sim p(\zeta)$, computing $\bar{t}=F(T(\zeta))$, sampling $\bar{\zeta} \sim p(\zeta|\bar{t})$ from the conditional given $T(\zeta)=\bar{t}$.
+This $\bar{\zeta}$ is distributed according to $p(\zeta)$ and, in particular, it's elements are i.i.d.~according to $p(x)$.
+\begin{proof}
+We begin by noting that:
+\begin{equation*}
+    p(\zeta) = \int_t p(\zeta|t)s(t)
+\label{eqn:1}
+\end{equation*}
+By assumption, $s(\bar{t}) = s(F(t)) = s(t)$. Thus, $p(\bar{\zeta}) = \int_{\bar{t}} p(\zeta|\bar{t})s(\bar{t}) = \int_{t} p(\zeta|t)s(t) = p(\zeta)$.
+Thus $\bar{\zeta} \sim p(\zeta)$.
+Since $p(\zeta)$ is the distribution over i.i.d.~samples from $p(x)$, the resulting elements of $\bar{\zeta}$ are also i.i.d.~from $p(x)$.
+\end{proof}
+\label{theorem:1}
+\end{theorem}
+
+We provide one example of a function $F$ with the desired property.
+
+\begin{lem}Let $F(t) = \textsc{CDF}(1 - \textsc{CDF}^{-1}(t))$ where \textsc{CDF} is the cumulative distribution function for $s(t)$. Then $s(F(t))= s(t)$.
+\end{lem}
+\begin{proof}
+Let $X \sim \textsc{U}(0,1)$. By definition, \textsc{CDF}$(X)$ will be distributed as $s(t)$. Trivially, $\textsc{CDF}^{-1}(t) \sim \textsc{U}(0,1)$ when $t \sim s(t)$, and so too is $1-\textsc{CDF}^{-1}(t)$.
+\end{proof}
+
+\begin{corollary}
+Let $\theta = \mathbf{E}_p[h(x)]$ be a function  expectation of interest with respect to a distribution, $p(x), x \in \mathbf{R}$. Let $\hat{\theta}_1$ be an unbiased Monte Carlo estimate using i.i.d. samples $\zeta \sim p(\zeta)$. Let $\hat{\theta}_2$ be an ``antithetic" estimate using samples $\bar{\zeta}$ generated as in Theorem~\ref{theorem:1}. Then the following hold,
+
+\begin{itemize}
+    \item $\hat{\theta}_2$ is unbiased estimate of $\theta$
+    \item $\hat{\theta}_3 = \frac{\hat{\theta}_1 + \hat{\theta}_2}{2}$  is unbiased estimate of $\theta$
+    \item Let $F = \textsc{CDF}(1 - \textsc{CDF}^{-1}(T))$. Then the first and second moments of $\zeta$ are anti-correlated to those of $\bar{\zeta}$
+\end{itemize}
+\label{corollary:1}
+\end{corollary}
+
+\begin{proof}
+By Theorem~\ref{theorem:1}, ``antithetic'' samples $\bar{\zeta} \sim p(\zeta)$ i.i.d., hence $\hat{\theta}_2$ is unbiased ($\hat{\theta}_2$ is equivalent to  $\hat{\theta}_1$). $\hat{\theta}_3$ is also  unbiased as a linear combination of two unbiased estimators is itself unbiased. Anti-correlation of moments falls from choice of $F$.
+\end{proof}
+
+In the paper, we proposed the following proposition.
+
+\begin{prop}
+For any $k > 2$, $\mu \in \mathbf{R}$ and $\sigma^2 \in \mathbf{R}^{+}$, if $\eta \sim \mathcal{N}(\mu, \frac{\sigma^2}{k})$ and $\frac{(k-1)\delta^2}{\sigma^2} \sim \chi^2_{k-1}$, and $\bar{\eta} = f(\eta), \bar{\delta}^2 = g(\delta^2; \sigma^2)$ for some functions $f: \mathbf{R} \rightarrow \mathbf{R}$ and $g: \mathbf{R} \rightarrow \mathbf{R}$, and $\epsilon = (\epsilon_1, ..., \epsilon_k) \sim \mathcal{N}(0, 1)$, then the ``antithetic" samples \[\zeta = (x_1, ..., x_k) = \textsc{MarsagliaSample}(\epsilon, \bar{\eta}, \bar{\delta}^2, k)\] are independent normal variates sampled from $\mathcal{N}(\mu, \sigma^2)$ such that $\frac{1}{k}\sum_i^k x_i = \bar{\eta}$ and $\frac{1}{k}\sum_i^k (x_i - \bar{\eta})^2 = \bar{\delta}^2$.
+\label{prop:3}
+\end{prop}
+
+\begin{proof}
+Define a statistic $T  = [\bar{\eta}, \bar{\delta}^2]$, and function $F = [f, g]$. Marsaglia's algorithm (or Pullin's, Cheng's) can be seen as a method for sampling from $p(\zeta|t)$ for a fixed statistic $t$. In Proposition~\ref{prop:3}, we first sample $t \sim s(T(\zeta))$ where $\zeta \sim \mathcal{N}(\mu, \sigma^2)$. Then, we choose ``antithetic" statistics using
+\begin{align*}
+    f & = \textsc{GaussianCDF}(1 - \textsc{GaussianCDF}^{-1}(\eta)) \\
+    g & = \frac{\sigma^2}{(k-1)}\textsc{ChiSquaredCDF}(1 - \textsc{ChiSquaredCDF}^{-1}(\frac{(k-1)\delta^2}{\sigma^2}))
+\end{align*}
+such that $s(F(t)) = s(t)$ by symmetry in $\textup{U}(0, 1)$. By Theorem~\ref{theorem:1}, antithetic samples $\bar{\zeta}$ are distributed as $\zeta$ is.
+\end{proof}
+In practice, we use both $\zeta$ and $\bar{\zeta}$ for stochastic estimation, as anti-correlated moments provide empirical benefits.
+
+\subsubsection{Properties of Marsaglia's Method}
+
+\begin{theorem}
+Let $\epsilon = (\epsilon_1, ..., \epsilon_{k-1}) \sim \mathcal{N}(0, 1)$ auxiliary variables.  Let $\eta, \delta$ be known variables. Then $\zeta = (x_1, ..., x_k) = \textsc{MarsagliaSample}(\epsilon, \eta, \delta^2, k)$ are uniform samples from the sphere
+\[S = \{(x_1, ..., x_k) | \sum_i^k x_i = k\eta, \sum_i^k(x_i - \eta)^2 = k \delta^2\}\]
+\begin{proof}
+$S$ is the intersection of a hyperplane and the surface of a $k$-sphere: the surface of a $(k-1)$-sphere. Marsaglia uses the following to sample from $S$:
+
+Let $z = (z_1, ..., z_{k-1})$ be a sample drawn uniformly from the unit $(k-1)$-sphere centered at the origin. (In practice, set $z_i = \epsilon_i / \sqrt{\sum_j^k \epsilon_j^2}$.) Let
+\begin{equation*}
+    \zeta = rzB + \eta v
+\end{equation*}
+where $v = (1, 1, ..., 1)$ and choose $B$ to be a $(k-1)$ by $k$ matrix whose rows form an orthonormal basis with the null space of $v$. By definition, $BB^t = I$ and $Bv^t = 0$ where $I$ is the identity matrix. We note the following consequence:
+\begin{align*}
+    \zeta v^t &= (rzB + \eta v)v^t\\
+                 &= rzBv^t + \eta vv^t\\
+                 &= 0 + \eta vv^t\\
+                 &= k\eta
+\end{align*}
+\begin{align*}
+    (\zeta - \eta v)(\zeta - \eta v)^t &=
+    (rzB + \eta v - \eta v)(rzB + \eta v - \eta v)^t\\
+    &= (rzB)(rzB)^t \\
+    &= r^2zBB^tz^t \\
+    &= r^2zz^t \\
+    &= r^2
+\end{align*}
+
+$k\eta$ and $r^2$ exactly match the constraints defined in $S$. So $\zeta \in S$. Further $\zeta$ is uniformly distributed in S as $z$ is uniform over the $(k-1)$-sphere.
+\end{proof}
+\label{theorem:2}
+\end{theorem}
+
+\begin{theorem} Let  $\zeta
+= (x_1, ..., x_k)
+\sim p(\zeta)$  be a random vector of i.i.d. Gaussians $\mathcal{N}(\mu, \sigma^2)$. Let $\eta=\frac{1}{k}\sum_i^k x_i$ and $\delta^2 = \frac{1}{k}\sum_i^k (x_i - \eta)^2$. Then
+$\eta \sim \mathcal{N}(\mu, \frac{\sigma^2}{k})$ and $\frac{(k-1)\delta^2}{\sigma^2} \sim \chi^2_{k-1}$ and $\eta,\delta^2$ are independent random variables.
+\begin{proof}
+This is a known property of Gaussian distributions. Reference \textit{Statistics: An introductory analysis} or any introductory statistics textbook.
+\end{proof}
+\label{marginal:1}
+\end{theorem}
+
+\begin{theorem} Let  $\zeta=(x_1, ..., x_k)$  be a random vector of i.i.d. Gaussians $\mathcal{N}(\mu, \sigma^2)$. Let $\eta=\frac{1}{k}\sum_i^k x_i = $ and $\delta^2 = \frac{1}{k}\sum_i^k (x_i - \eta)^2$ and $T  = [\eta, \delta^2]$. Let $p(\zeta, T(\zeta)) = p(\zeta, \eta,\delta^2)$ denote their joint distribution.
+Then, the conditional density is of the form
+    \begin{equation}
+        p(\zeta | \eta=\eta,\delta^2 = \delta^2 ) = \begin{cases}
+ & a \text{ if } \zeta \in S \\
+ & 0 \text{ if } \zeta \notin S.
+\end{cases}
+\end{equation}
+where $S = \{(x_1, ..., x_k) | \sum_i x_i = k\eta, \sum_i(x_i - \eta)^2 = k \delta^2\}$,  $0 < a < 1$ is a constant.
+\begin{proof}
+\noindent\newline\textbf{Intuition:} Level sets of a multivariate isotropic Gaussian density function are spheres. The event we are conditioning on is a sphere.
+
+\noindent\newline\textbf{Formal Proof:}    Let $f(x_1, ...,x_k) = (2\pi\sigma^2)^{-k/2} e^{(-\sum_i(x_i - \mu)^2 / (2\sigma^2))}$ denote a Gaussian density. Note the following derivation:
+    \begin{align*}
+        \sum_{i=1}^k(x_i - \mu)^2 &= \sum_i(x_i - \eta)^2 + 2(\eta - \mu)\sum_i(x_i - \eta) + k(\eta - \mu)^2\\
+                            &= \sum_i(x_i - \eta)^2 + k(\eta - \mu)^2\\
+                            &= r^2 + k(\eta - \mu)^2\label{eqn:constant}
+    \end{align*}
+ This implies $f(x_1, ..., x_k)$ is equal for any $(x_1, ..., x_k) \in S$. Thus, the conditional distribution $p(\zeta | \zeta \in S)$ is the uniform distribution over $S$ for any $\mu, \sigma$.
+\end{proof}
+\label{conditional:1}
+\end{theorem}
+
+Finally, proof of Proposition 1 from the paper (denoted as Proposition~\ref{prop:marsaglia} here):
+\begin{prop}
+    For any $k>2$, $\mu \in \mathbf{R}$ and $\sigma^2>0$, if $\eta \sim \mathcal{N}(\mu, \frac{\sigma^2}{k})$ and $\frac{(k-1)\delta^2}{\sigma^2} \sim \chi^2_{k-1}$ and $\boldsymbol{\epsilon} = \epsilon_1, ..., \epsilon_{k-1} \sim \mathcal{N}(0, 1)$ i.i.d., then the generated samples $x_1, ..., x_k = \textsc{MarsagliaSample}(\boldsymbol{\epsilon}, \eta, \delta^2,k)$ are independent normal variates sampled from $\mathcal{N}(\mu, \sigma^2)$ such that $\frac{1}{k}\sum_i x_i = \eta$ and $\frac{1}{k}\sum_i(x_i - \eta)^2 = \delta^2$.
+    \label{prop:marsaglia}
+\end{prop}
+\begin{proof}
+Let  $\zeta=(x_1, ..., x_k)$  be a random vector of i.i.d. Gaussians $\mathcal{N}(\mu, \sigma^2)$. Compute $\eta=\frac{1}{k}\sum_i^k x_i$ and $\delta^2 = \frac{1}{k}\sum_i^k (x_i - \eta)^2$ and $T  = [\eta, \delta^2]$. Let $p(\zeta, T(\zeta)) = p(\zeta, \eta,\delta^2)$ denote their joint distribution.  Factoring
+\[
+p(\zeta, \eta, \delta^2) = p(\eta,\delta^2) p(\zeta \mid \eta, \delta^2)
+\],
+it is clear that we can sample from the joint by first sampling $\eta,\delta^2 \sim p(\eta, \delta^2)$ and then $\zeta' \sim p(\zeta \mid \eta=\eta,\delta^2=\delta^2)$. From Theorem \ref{marginal:1}, we know $p(\eta, \delta^2)$ analytically and from Theorem \ref{conditional:1} we know $p(\zeta \mid \eta,\delta^2)$ is a uniform distribution over the sphere. By assumption, $\eta,\delta^2$ are sampled independently from the correct marginal distributions from Theorem \ref{marginal:1}. Then, from Theorem \ref{theorem:2}, we know $\textsc{MarsagliaSample}(\epsilon, \eta, \delta^2, k)$ samples from the correct conditional density (i.e. from S). Thus, samples $\zeta'$ from \textsc{MarsagliaSample} will have the same distribution as $\zeta$, namely i.i.d. Gaussian.
+\end{proof}
+
+In the \textsc{AntitheticSample} proposition in the main text, we use the fact that the average of two unbiased estimators is an unbiased estimator. We provide the proof here.
+
+\begin{lem} A linear combination of two unbiased estimators is unbiased.
+\label{lemma:sum}
+\end{lem}
+\begin{proof} Let $e_1$ and $e_2$ denote two unbiased estimators that $\mathbf{E}[e_1] = \mathbf{E}[e_2] = \theta$ for some underlying parameter $\theta$. Define a third estimator $e_3 = k_1e_1 + k_2e_2$ where $k_1, k_2 \in \mathbb{R}$. We note that $\mathbf{E}[e_3] = k_1\mathbf{E}[e_1] + k_2\mathbf{E}[e_2]$ = $(k_1 + k_2)\theta$. Thus $e_3$ is unbiased if $k_1 + k_2 = 1$.
+\end{proof}
+
+\section{Chapter~\ref{chapter:vibo}}
+\label{sec:proof:vibo}
+\subsubsection{Proof of Theorem~\ref{thm:virtu}}
+
+\begin{proof}
+    Expand marginal and apply Jensen's inequality:
+    \begin{align*}
+        \log p_\theta(\mathbf{r}_{i,1:M}) &\geq \mathbf{E}_{q_\phi(\mathbf{a}_i, \mathbf{d}_{1:M}|\mathbf{r}_{i,1:M})}\left[ \log \frac{p_\theta(\mathbf{r}_{i,1:M},\mathbf{a}_i, \mathbf{d}_{1:M})}{q_\phi(\mathbf{a}_i, \mathbf{d}_{1:M}|\mathbf{r}_{i,1:M})} \right] \\
+        &= \mathbf{E}_{q_\phi(\mathbf{a}_i, \mathbf{d}_{1:M}|\mathbf{r}_{i,1:M})}\left[ \log p_\theta(\mathbf{r}_{i,1:M}|\mathbf{a}_i, \mathbf{d}_{1:M}) \right] \\
+        & \quad + \mathbf{E}_{q_\phi(\mathbf{a}_i, \mathbf{d}_{1:M}|\mathbf{r}_{i,1:M})}\left[ \log \frac{p(\mathbf{a}_i)}{q_\phi(\mathbf{a}_i|\mathbf{d}_{1:M},\mathbf{r}_{i,1:M})} \right] \\
+        & \quad + \mathbf{E}_{q_\phi(\mathbf{a}_i, \mathbf{d}_{1:M}|\mathbf{r}_{i,1:M})}\left[ \log \frac{p(\mathbf{d}_{1:M})}{q_\phi(\mathbf{d}_{1:M}|\mathbf{r}_{i,1:M})} \right] \\
+        &= \mathcal{L}_{\text{recon}} + \mathcal{L}_{\text{A}} + \mathcal{L}_{\text{B}}
+    \end{align*}
+    Rearranging the latter two terms, we find that:
+    \begin{align*}
+    \mathcal{L}_{\text{A}} &= \mathbf{E}_{q_\phi(\mathbf{d}_{1:M}|\mathbf{r}_{i,1:M})} \left[ \KL(q_\phi(\mathbf{a}_i|\mathbf{d}_{1:M},\mathbf{r}_{i,1:M}) || p(\mathbf{a}_i)) \right] \\
+    \mathcal{L}_{\text{B}} &= \mathbf{E}_{q_\phi(\mathbf{d}_{1:M}|\mathbf{r}_{i,1:M})}\left[ \log \frac{p(\mathbf{d}_{1:M})}{q_\phi(\mathbf{d}_{1:M}|\mathbf{r}_{i,1:M})} \right] \\
+    &= \KL(q_\phi(\mathbf{d}_{1:M}|\mathbf{r}_{i,1:M}) || p(\mathbf{d}_{1:M}))
+    \end{align*}
+    Since $\textup{VIBO} = \mathcal{L}_{\text{recon}} + \mathcal{L}_{\text{A}} + \mathcal{L}_{\text{B}}$, and KL terms are non-negative, we have shown that VIBO bounds $\log p_\theta(\mathbf{r}_{i,1:M})$.
+\end{proof}
+
+

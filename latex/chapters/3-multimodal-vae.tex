@@ -1,0 +1,469 @@
+\section{Introduction}
+\label{sec:introduction}
+Learning from diverse modalities has the potential to yield more  generalizable representations. For instance, the visual appearance and tactile impression of an object converge on a more invariant abstract characterization \cite{yildirim2014perception}.
+Similarly, an image and a natural language caption can capture complimentary but converging information about a scene \cite{vinyals2015show, xu2015show}.
+While fully-supervised deep learning approaches can learn to bridge modalities, generative approaches promise to capture the joint distribution across modalities and flexibly support missing data.
+Indeed, multimodal data is \textit{expensive} and \textit{sparse}, leading to a \emph{weakly supervised} setting of having only a small set of examples with all observations present, but having access to a larger dataset with one (or a subset of) modalities.
+
+We propose a novel multimodal variational autoencoder (MVAE) to learn a joint distribution under weak supervision. The VAE \cite{kingma2013auto} jointly trains a generative model, from latent variables to observations, with an \emph{inference network} from observations to latents. Moving to multiple modalities and missing data, we would naively need an inference network for each combination of modalities. However, doing so would result in an exponential explosion in the number of trainable parameters.
+Assuming conditional independence among the modalities, we show that the correct inference network will be a product-of-experts \cite{hinton2006training}, a structure which reduces the number of inference networks to one per modality.
+While the inference networks can be best trained separately, the generative model requires joint observations.
+Thus we propose a sub-sampled training paradigm in which fully-observed examples are treated as both fully and partially observed (for each gradient update).
+Altogether, this provides a novel and useful solution to the multi-modal inference problem.
+
+We report experiments to measure the quality of the MVAE, comparing with previous models. We train on MNIST \cite{lecun1998gradient}, binarized MNIST \cite{larochelle2011neural}, MultiMNIST \cite{eslami2016attend, sabour2017dynamic}, FashionMNIST \cite{xiao2017fashion}, and CelebA \cite{liu2015faceattributes}. Several of these datasets have complex modalities---character sequences, RGB images---requiring large inference networks with RNNs and CNNs.
+We show that the MVAE is able to support heavy encoders with thousands of parameters, matching state-of-the-art performance.
+
+We then apply the MVAE to problems with more than two modalities. First, we revisit CelebA, fitting the model with each of the 18 attributes as separate modalities. Doing so, we find better performance from sharing of statistical strength. We further explore this question by choosing a handful of image transformations commonly studied in computer vision---colorization, edge detection, segmentation, etc.---and synthesize a dataset by applying them to CelebA. We show that the MVAE can translate between transformed and untransformed images by sampling.
+
+Finally, we investigate how the MVAE performs under incomplete supervision by reducing the number of multi-modal examples. We find that the MVAE is able to capture a good joint representation when only a small percentage of examples are multi-modal. To show real world applicability, we then investigate weak supervision on machine translation where each language is a modality.
+\section{Multimodal Variational Autoencoder}
+\label{sec:methods}
+% A variational autoencoder (VAE) \cite{kingma2013auto} is a latent variable generative model of the form $p_{\theta}(x, z) = p(z)p_{\theta}(x|z)$ where $p(z)$ is a prior, usually spherical Gaussian. The decoder, $p_{\theta}(x|z)$, consists of a deep neural net, with parameters $\theta$, composed with a simple likelihood (e.g.~Bernoulli or Gaussian).
+% The goal of training is to maximize the marginal likelihood of the data (the ``evidence''); however since this is intractable, the evidence lower bound (ELBO) is instead optimized.
+% The ELBO is defined via an inference network, $q_{\phi}(z|x)$, which serves as a tractable importance distribution:
+% \begin{equation}
+% \label{eq:elbo}
+%     \textup{ELBO}(x) \triangleq \mathbb{E}_{q_{\phi}(z|x)}[\lambda \textup{ log }p_{\theta}(x|z)] - \beta \textup{ KL}[q_{\phi}(z|x), p(z)]
+% \end{equation}
+% where $\textup{KL}[p, q]$ is the Kullback-Leibler divergence between distributions $p$ and $q$; $\beta$ \cite{higgins2016beta} and $\lambda$ are weights balancing the terms in the ELBO. In practice, $\lambda=1$ and $\beta$ is slowly annealed to 1 \cite{bowman2015generating} to form a valid lower bound on the evidence.
+% The ELBO is usually optimized (as we will do here) via stochastic gradient descent, using the reparameterization trick to estimate the gradient \cite{kingma2013auto}.
+
+\begin{figure}[h!]
+\centering
+    \begin{subfigure}[b]{.2\linewidth}
+        \centering
+        \includegraphics[width=.75\linewidth]{./images/chapter3/graph.pdf}
+        \caption{}
+        \label{fig:diagram:graph}
+    \end{subfigure}\hspace{5mm}
+    \begin{subfigure}[b]{.2\linewidth}
+        \includegraphics[width=\linewidth]{./images/chapter3/modelv4}
+        \caption{}
+        \label{fig:diagram:modelv2}
+    \end{subfigure}\hspace{5mm}
+    \begin{subfigure}[b]{.23\linewidth}
+        \includegraphics[width=\linewidth]{./images/chapter3/modelv5}
+        \caption{}
+        \label{fig:diagram:modelv3}
+    \end{subfigure}\hspace{5mm}
+    \caption{(a) Graphical model of the MVAE. Gray circles represent observed variables. (b) MVAE architecture with $N$ modalities. $E_{i}$ represents the $i$-th inference network; $\mu_{i}$ and $\sigma_{i}$ represent the $i$-th variational parameters; $\mu_{0}$ and $\sigma_{0}$ represent the prior  parameters. The product-of-experts (PoE) combines all variational parameters in a principled and efficient manner. (c) If a modality is missing during training, we drop the respective inference network. Thus, the parameters of encoders $E_{1}, ..., E_{N}$ are shared across different combinations of missing inputs.}
+    \label{fig:diagram}
+\end{figure}
+
+We assume $N$ modalities, $x_{1}$, ..., $x_{N}$ that are conditionally independent given the common latent variable, $z$ (See Figure~\ref{fig:diagram:graph}). Examples of a modality include data types like images and language, or can be more granular like different channels of an image. 
+Either way, we assume a generative model of the form 
+\begin{equation}
+p_{\theta}(x_{1}, x_{2}, ..., x_{N}, z) = p_{\theta}(z)p_{\theta}(x_{1}|z)p_{\theta}(x_{2}|z)\cdots p_{\theta}(x_{N}|z).
+\end{equation}
+A primary benefit of this factorization is that we may ignore unobserved modalities when evaluating the marginal likelihood. For instance, if we are unable to access the $i$-th modality (it may be missing or corrupted), we can still compute probability $p_\theta(x_1, \ldots x_{i-1}, x_{i+1}, \ldots, x_N, z) = p(z)\prod_{j\neq i} p(x_i | z)$. We will see later how to use this observation to train the MVAE to be robust to missing data.
+
+The learning objective for the MVAE is a generalization of the ELBO (Equation~\ref{eq:elbo}). If we write a data point as the collection of modalities present, that is $X = \{x_i | \text{$i^{th}$ modality present}\}$, then the ELBO becomes:
+\begin{equation}
+\label{eq:mmelbo}
+    \textup{ELBO}(\theta, \phi) = \mathbb{E}_{q_{\phi}(z|X)}[\sum_{x_i \in X} \lambda_{i} \textup{ log }p_{\theta}(x_{i}|z)] - \beta \textup{ KL}[q_{\phi}(z|X), p_\theta(z)].
+\end{equation}
+Unlike Equation~\ref{eq:elbo}, this equation has a few additional scaling constants: $\lambda_1, \cdots, \lambda_N$ control the magnitude of the likelihood terms for $N$ modalities. This may be important if the modalities are of different dimensionalities: without scaling to balance the likelihoods, one modality may be prioritized at the expense of another. Additionally, $\beta$ is a scaling term between the likleihoods and the regularizer. In some cases, $\beta$ is annealed throughout training from $0$ to $\beta$ \cite{higgins2016beta} to avoid posterior collapse where the approximate posterior $q_\phi$ closely matches the prior. Equation~\ref{eq:elbo} can be optimized by stochastic gradient descent.
+
+\subsection{Approximating The Joint Posterior}
+
+The first obstacle to training the MVAE is specifying the $2^N$ inference networks, $q(z|X)$ for each subset of modalities $X \subseteq \{x_1, x_2, ..., x_N\}$.
+Previous work (e.g. \cite{suzuki2016joint, vedantam2017generative}) has assumed that the relationship between the joint- and single-modality inference networks is unpredictable (and therefore separate training is required).
+However, the optimal inference network $q(z|x_1, ..., x_N)$ would be the true posterior $p(z|x_1, ..., x_N)$.
+The conditional independence assumptions in the generative model imply a relation among joint- and single-modality posteriors:
+%We first derive the form of the joint posterior $p(z|x_1, ..., x_N)$ as a function of unimodal posteriors $p(z|x_i)$, $i = 1, ..., N$, and formally motivate the use of a universal prior $p(z)$ in a product-of-experts inference network (\cite{vedantam2017generative}).
+\begin{equation}
+\begin{aligned}
+p(z|x_1, ..., x_N) & = \frac{p(x_1, ..., x_N|z)p(z)}{p(x_1, ..., x_N)} =  \frac{p(z)}{p(x_1, ..., x_N)}\prod_{i=1}^{N} p(x_i|z) \\
+& = \frac{p(z)}{p(x_1, ..., x_N)}\prod_{i=1}^{N} \frac{p(z|x_i)p(x_i)}{p(z)}
+ = \frac{\prod_{i=1}^{N}p(z|x_i)}{\prod_{i=1}^{N-1}p(z)} \cdot \frac{\prod_{i=1}^{N} p(x_i)}{p(x_1, ..., x_N)} \\
+ &\propto \frac{\prod_{i=1}^{N}p(z|x_i)}{\prod_{i=1}^{N-1}p(z)} \\
+\end{aligned}
+\label{eqn:derive}
+\end{equation}
+That is, the joint posterior is a product of individual posteriors, with an additional quotient by the prior. If we assume that the true posteriors for each individual factor $p(z|x_i)$ is properly contained in the family of its variational counterpart, $q(z|x_i)$, then Equation~\ref{eqn:derive} suggests that the correct $q(z|x_1, ..., x_N)$ is a product and quotient of experts: $\frac{\prod_{i=1}^{N}q(z|x_i)}{\prod_{i=1}^{N-1}p(z)}$, which we call MVAE-Q. Without this assumption, the best approximation to a product of factors may not be the product of the best approximations for each individual factor. Nonetheless, the product of $q(z|x_i)$ is still a tractable family of approximations in this case.
+
+Alternatively, if we approximate $p(z|x_i)$ with $q(z|x_i) \equiv \tilde{q}(z|x_i)p(z)$, where $\tilde{q}(z|x_i)$ is the underlying inference network, we can avoid the quotient term:
+\begin{equation}
+\begin{aligned}
+p(z|x_1, ..., x_N)
+\propto \frac{\prod_{i=1}^{N}p(z|x_i)}{\prod_{i=1}^{N-1}p(z)}
+\approx \frac{\prod_{i=1}^{N}[\tilde{q}(z|x_i)p(z)]}{\prod_{i=1}^{N-1}p(z)}
+= p(z)\prod_{i=1}^{N}\tilde{q}(z|x_i). \\
+\end{aligned}
+\label{eqn:derive:simple}
+\end{equation}
+In other words, we can use a product of experts (PoE), including a ``prior expert'', as the approximating distribution for the joint-posterior (Figure \ref{fig:diagram:modelv2}).
+This representation is simpler and, as we describe below, numerically more stable.
+This derivation is easily extended to any subset of modalities yielding $q(z|X) \propto p(z)\prod_{x_{i} \in X} \tilde{q}(z|x_{i})$ (Figure \ref{fig:diagram:modelv3}). We refer to this version as MVAE.
+
+The product and quotient distributions required above are not in general solvable in closed form.
+However, when $p(z)$ and $\tilde{q}(z|x_i)$ are Gaussian there is a simple analytical solution: a product of Gaussian experts is itself Gaussian \cite{cao2014generalized} with mean $\mu = (\sum_{i} \mu_{i}\text{T}_{i})(\sum_{i}\text{T}_{i})^{-1}$ and covariance $V = (\sum_{i} \text{T}_{i})^{-1}$, where $\mu_{i}$, $V_{i}$ are the parameters of the $i$-th Gaussian expert, and $\text{T}_{i} = V_{i}^{-1}$ is the inverse of the covariance.
+Similarly, given two Gaussian experts, $p_1(x)$ and $p_2(x)$, we can show that the quotient (QoE), $\frac{p_1(x)}{p_2(x)}$, is also a Gaussian with mean $\mu = (\text{T}_{1}\mu_{1} - \text{T}_{2}\mu_{2})(\text{T}_1 - \text{T}_2)^{-1}$ and covariance $V = (\text{T}_1 - \text{T}_2)^{-1}$, where $T_i = V_{i}^{-1}$.
+However, this distribution is well-defined only if $V_{2} > V_{1}$ element-wise---a simple constraint that can be hard to deal with in practice. A derivation for PoE and QoE can be found in Section~\ref{sec:proof:mvae}.
+
+Thus we can compute all $2^N$ multi-modal inference networks required for MVAE efficiently in terms of the $N$ uni-modal components, $\tilde{q}(z|x_{i})$.
+% ; the additional quotient needed by the MVAE-Q variant is also easily calculated but requires an added constraint on the variances.
+
+\subsection{Sub-sampled Training Paradigm}
+
+On the face of it, we can now train the MVAE by simply optimizing the ELBO given in Equation~\ref{eq:mmelbo}.
+However, a product-of-Gaussians does not uniquely specify its component Gaussians. Hence, given a \textit{complete} dataset, with no missing modalities, optimizing Equation~\ref{eq:mmelbo} has an unfortunate consequence: we never train the individual inference networks (or small sub-networks) and thus do not know how to use them if presented with missing data at test time.
+Conversely, if we treat every observation as independent observations of each modality, we can adequately train the inference networks $\tilde{q}(z|x_{i})$, but will fail to capture the relationship between modalities in the generative model.
+
+We propose instead a simple training scheme that combines these extremes, including ELBO terms for whole and partial observations. For instance, with $N$ modalities, a complete example, $\{x_{1}, x_{2}, ..., x_{N}\}$ can be split into $2^{N}$ partial examples: $\{x_{1}\}$, $\{x_{2}, x_{6}\}$, $\{x_{5}, x_{N-4}, x_{N}\}$, .... If we were to train using all $2^N$ subsets it would require evaluating $2^N$ ELBO terms. This is computationally intractable. To reduce the cost, we sub-sample which ELBO terms to optimize for every gradient step. Specifically, we choose (1) the ELBO using the product of all $N$ Gaussians, (2) all ELBO terms using a single modality, and (3) $k$ ELBO terms using $k$ randomly chosen subsets, $X_k$. For each minibatch, we thus evaluate a random subset of the $2^{N}$ ELBO terms. In expectation, we will be approximating the full objective. The sub-sampled objective can be written as:
+\begin{equation}
+  \textup{ELBO}(x_1, ..., x_N) + \sum_{i=1}^{N}\textup{ELBO}(x_i) + \sum_{j=1}^{k}\textup{ELBO}(X_j)
+  \label{eqn:subsample-elbo}
+\end{equation}
+We explore the effect of $k$ in Sec.~\ref{sec:results}. A pleasant side-effect of this training scheme is that it generalizes to weakly-supervised learning. Given an example with missing data, $X = \{x_i | \text{$i^{th}$ modality present}\}$, we can still sample partial data from $X$, ignoring modalities that are missing.
+
+\section{Empirical Evaluation}
+\label{sec:experiments}
+We transform uni-modal datasets into multi-modal problems by treating labels as a second modality. We compare existing models (VAE, BiVCCA, JMVAE) to the MVAE and show that we equal state-of-the-art performance on four image datasets: MNIST, FashionMNIST, MultiMNIST, and CelebA. For each dataset, we keep the network architectures consistent across models, varying only the objective and training procedure. Unless otherwise noted, given images $x_1$ and labels $x_2$, we set $\lambda_1 = 1$ and $\lambda_2 = 50$. We find that upweighting the reconstruction error for the low-dimensional modalities is important for learning a good joint distribution.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{ l|c|c|c|c|c }
+    \toprule
+    Model & BinaryMNIST & MNIST & FashionMNIST & MultiMNIST & CelebA \\
+    \hline
+    VAE & 730240 & 730240 & 3409536 & 1316936 & 4070472 \\
+    CVAE & 735360 & 735360 & 3414656 & -- & 4079688 \\
+    BiVCCA & 1063680 & 1063680 & 3742976 & 1841936 & 4447504 \\
+    JMVAE & 2061184 & 2061184 & 7682432 & 4075064 & 9052504 \\
+    MVAE-Q & 1063680 & 1063680 & 3742976 & 1841936 & 4447504 \\
+    MVAE & 1063680 & 1063680 & 3742976 & 1841936 & 4447504 \\
+    JMVAE19 & -- & -- & -- & -- & 3.6259e12 \\
+    MVAE19 & -- & -- & -- & -- & 10857048 \\
+    \bottomrule
+\end{tabular}
+\caption{\textit{Number of inference network parameters.} For a single dataset, each generative model uses the same inference network architecture(s) for each modality. Thus, the difference in parameters is solely due to how the inference networks interact in the model. We note that MVAE has the same number of parameters as BiVCCA. JMVAE19 and MVAE19 show the number of parameters using 19 inference networks when each of the attributes in CelebA is its own modality.}
+\label{table:parameters}
+\end{table}
+
+Our version of MultiMNIST contains between 0 and 4 digits composed together on a 50x50 canvas. Unlike \cite{eslami2016attend}, the digits are fixed in location. We generate the second modality by concatenating digits from top-left to bottom-right to form a string. As in literature, we use a RNN encoder and decoder \cite{bowman2015generating}. Furthermore, we explore two versions of learning in CelebA, one where we treat the 18 attributes as a single modality, and one where we treat each attribute as its own modality for a total of 19. We denote the latter as MVAE19. In this scenario, to approximate the full objective, we set $k = 1$ for a total 21 ELBO terms (as in Equation~\ref{eqn:subsample-elbo}). For complete details, including training hyperparameters and encoder/decoder architecture specification, refer to Section~\ref{sec:app:mvae}.
+
+\subsubsection{Evaluation Metrics}
+
+In the bi-modal setting with $x_1$ denoting the image and $x_2$ denoting the label, we measure the test marginal log-likelihood, $\textup{log }p(x_{1})$, and test joint log-likelihood $\textup{log }p(x_1, x_2)$ using $100$ importance samples in CelebA and $1000$ samples in other datasets. In doing so, we have a choice of which inference network to use. For example, using $q(z|x_1)$, we estimate $\textup{log } p(x_1) \approx \textup{log } \mathbb{E}_{q(z|x_1)}[ \frac{p(x_1|z)p(z)}{q(z|x_1)} ]$. We also compute the test conditional log-likelihood $\textup{log }p(x_1|x_2)$, as a measure of classification performance, as done in \cite{suzuki2016joint}: $\textup{log } p(x_1|x_2) \approx \textup{log } \mathbb{E}_{q(z|x_2)}[ \frac{p(x_1|z)p(x_2|z)p(z)}{q(z|x_2)}] - \textup{log }\mathbb{E}_{p(z)}[p(x_2|z)]$.
+In CelebA, we use 1000 samples to estimate $\mathbb{E}_{p(z)}[p(x_2|z)]$. In all others, we use 5000 samples. These marginal probabilities measure the ability of the model to capture the data distribution and its conditionals. Higher scoring models are better able to generate proper samples and convert between modalities, which is exactly what we find desirable in a generative model.
+
+\paragraph{Quality of the Inference Network} In all VAE-family models, the inference network functions as an \textit{importance distribution} for approximating the intractable posterior. A better importance distribution, which more accurately approximates the posterior, results in importance weights with lower variance. The optimal importance distribution, where $q(z|x) = p(z|x)$, would result in zero variance as $\frac{p(x,z)}{p(z|x)} = p(x)$, a constant w.r.t. samples $z \sim p(z|x)$. Thus, we estimate the variance of the (log) importance weights as a measure of inference network quality (see Table~\ref{table:x_variances}).
+
+\begin{table}[tb]
+\centering
+\small
+\begin{tabular}{ l|c|c|c|c|c }
+    \toprule
+    Model & BinaryMNIST & MNIST & FashionMNIST & MultiMNIST & CelebA \\
+    \hline
+    \multicolumn{6}{c}{Estimated $\textup{log }p(x_{1})$} \\
+    \hline
+    VAE & -86.313 & -91.126 & -232.758 & -152.835 & -6237.120 \\
+    BiVCCA & -87.354 & -92.089 & -233.634 & -202.490 & -7263.536 \\
+    JMVAE & -86.305 & -90.697 & -232.630 & -152.787 & -6237.967 \\
+    MVAE-Q & -91.665 & -96.028 & -236.081 & -166.580 & -6290.085 \\
+    MVAE & \textbf{-86.026} & \textbf{-90.619} & \textbf{-232.535} & \textbf{-152.761} & -6236.923 \\
+    MVAE19 & -- & -- & -- & -- & \textbf{-6236.109} \\
+    \hline
+    \multicolumn{6}{c}{Estimated $\textup{log }p(x_{1},x_{2})$} \\
+    \hline
+    JMVAE & -86.371 & \textbf{-90.769} & \textbf{-232.948} & \textbf{-153.101} & -6242.187 \\
+    MVAE-Q & -92.259 & -96.641 & -236.827 & -173.615 & -6294.861 \\
+    MVAE & \textbf{-86.255} & -90.859 & -233.007 & -153.469 & -6242.034 \\
+    MVAE19 & -- & -- & -- & -- & \textbf{-6239.944} \\
+    \hline
+    \multicolumn{6}{c}{Estimated $\textup{log }p(x_{1}|x_{2})$} \\
+    \hline
+    CVAE & \textbf{-83.448} & \textbf{-87.773} & \textbf{-229.667} & -- & -6228.771 \\
+    JMVAE & -83.985 & -88.696 & -230.396 & \textbf{-145.977} & \textbf{-6231.468} \\
+    MVAE-Q & -90.024 & -94.347 & -234.514 & -163.302 & -6311.487 \\
+    MVAE & -83.970 & -88.569 & -230.695 & -147.027 & -6234.955 \\
+    MVAE19 & -- & -- & -- & -- & -6233.340 \\
+    \bottomrule
+\end{tabular}
+\caption{Estimates (using $q(z|x_{1})$) for marginal probabilities on the average test example. MVAE and JMVAE are roughly equivalent in data log-likelihood but as Table \ref{table:parameters} shows, MVAE uses far fewer parameters. The CVAE is often better at capturing $p(x_{1}|x_{2})$ but does not learn a joint distribution.}
+\label{table:x_results}
+\end{table}
+
+\label{sec:results}
+Figure~\ref{fig:samples} shows image samples and conditional image samples for each dataset using the image generative model.
+%, $p(x_1|z)$ and sampling from either $z \sim p(z)$ or $z \sim q(z|x_2)$.
+% \ndg{in the conditional case, is the encoder q(z|x,y) or q(z|y)?}
+We find the samples to be good quality, and find conditional samples to be largely correctly matched to the target label.
+%(The MVAE used to generate these images was trained with TELBO where the hyperparameters $\lambda_{x}$ and $\lambda_{y}$ were chosen based on reconstruction quality.)
+% \ndg{say above in experiments section what lambda params are and how they are set?}
+Table~\ref{table:x_results} shows test log-likelihoods for each model and dataset. We see that MVAE performs on par with the state-of-the-art (JMVAE) while using far fewer parameters (see Table~\ref{table:parameters}).
+%Regarding computation time, in the bi-modal setting, JMVAE takes $212.3 \pm 23.6$ seconds per epoch on CelebA while MVAE takes $210.5 \pm 21.2$ seconds (measured over 10 trials). Going beyond bi-modality, the savings in wall-clock time for MVAE is again, exponential.
+%\ndg{removed this because its not impressive, or that informative....}
+% \rdh{Is there a wall-clock time to report? Is it also faster to train?}
+When considering only $p(x_1)$ (i.e.~the likelihood of the image modality alone), the MVAE also performs best, slightly beating even the image-only VAE, indicating that solving the harder multi-modal problem does not sacrifice any uni-modal model capacity and perhaps helps. On CelebA, MVAE19 (which treats features as independent modalities) out-performs the MVAE (which treats the feature vector as a single modality). This suggests that the PoE approach generalizes to a larger number of modalities, and that jointly training shares statistical strength. 
+% Moreover, we show in the supplement that the MVAE19 is robust to randomly dropping modalities.
+
+\begin{figure}
+\centering
+  \begin{subfigure}[b]{.22\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{images/chapter3/sample_mnist.png}
+    \caption{}
+  \end{subfigure}
+  \begin{subfigure}[b]{.22\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{images/chapter3/sample_mnist_eq_5.png}
+    \caption{}
+  \end{subfigure}
+  \begin{subfigure}[b]{.22\linewidth}
+    \includegraphics[width=\linewidth]{images/chapter3/sample_fashion_mnist.png}
+    \caption{}
+  \end{subfigure}
+  \begin{subfigure}[b]{.22\linewidth}
+    \includegraphics[width=\linewidth]{images/chapter3/sample_fashion_mnist_eq_9.png}
+    \caption{}
+  \end{subfigure}
+
+  \begin{subfigure}[b]{.22\linewidth}
+    \includegraphics[width=\linewidth]{images/chapter3/sample_multi_mnist.png}
+      \caption{}
+  \end{subfigure}
+  \begin{subfigure}[b]{.22\linewidth}
+    \includegraphics[width=\linewidth]{images/chapter3/sample_multi_mnist_eq_1773.png}
+    \caption{}
+  \end{subfigure}
+  \begin{subfigure}[b]{.22\linewidth}
+    \includegraphics[width=\linewidth]{images/chapter3/sample_celeba.png}
+    \caption{}
+  \end{subfigure}
+  \begin{subfigure}[b]{.22\linewidth}
+    \includegraphics[width=\linewidth]{images/chapter3/sample_celeba_eq_Male.png}
+    \caption{}
+  \end{subfigure}
+  \caption{\textit{Image samples using MVAE}. (a, c, e, g) show 64 images per dataset by sampling $z \sim p(z)$ and then generating via $p(x_1|z)$. Similarly, (b, d, f, h) show conditional image reconstructions by sampling $ z \sim q(z|x_2)$ where (b) $x_2=5$, (d) $x_2=\textup{Ankle boot}$, (f) $x_2=1773$, (h) $x_2=\textup{Male}$.}
+  \label{fig:samples}
+\end{figure}
+
+Tables \ref{table:x_variances} show variances of log importance weights.
+% using $q(z|x_1)$. See supplement for variances using $q(z|x_1,x_2)$.
+The MVAE always produces lower variance than other methods that capture the joint distribution, and often lower than conditional or single-modality models.
+Furthermore, MVAE19 consistently produces lower variance than MVAE in CelebA.
+Overall, this suggests that the PoE approach used by the MVAE yields better inference networks.
+
+\begin{table}[h!]
+\centering
+\small
+\begin{tabular}{ l|c|c|c|c|c }
+    \toprule
+    Model & BinaryMNIST & MNIST & FashionMNIST & MultiMNIST & CelebA \\
+    \hline
+    \multicolumn{6}{c}{Variance of Marginal Log Importance Weights: $\textup{var}(\textup{log}(\frac{p(x_1,z)}{q(z|x_1)}))$} \\
+    \hline
+    VAE & 22.264 & 26.904 & 25.795 & 54.554 & \textbf{56.291} \\
+    BiVCCA & 55.846 & 93.885 & 33.930 & 185.709 & 429.045 \\
+    JMVAE & 39.427 & 37.479 & 53.697 & 84.186 & 331.865 \\
+    MVAE-Q & 34.300 & 37.463 & 34.285 & 69.099 & 100.072 \\
+    MVAE & \textbf{22.181} & \textbf{25.640} & \textbf{20.309} & \textbf{26.917} & 73.923 \\
+    MVAE19 & -- & -- & -- & -- & 71.640 \\
+    \hline
+    \multicolumn{6}{c}{Variance of Joint Log Importance Weights: $\textup{var}(\textup{log}(\frac{p(x_1,x_2,z)}{q(z|x_1)}))$} \\
+    \hline
+    JMVAE & 41.003 & 40.126 & 56.640 & 91.850 & 334.887 \\
+    MVAE-Q & 34.615 & 38.190 & 34.908 & 64.556& 101.238\\
+    MVAE & \textbf{23.343} & \textbf{27.570} & \textbf{20.587} & \textbf{27.989} & 76.938 \\
+    MVAE19 & -- & -- & -- & -- & \textbf{72.030} \\
+    \hline
+    \multicolumn{6}{c}{Variance of Conditional Log Importance Weights: $\textup{var}(\textup{log}(\frac{p(x_1,z|x_2)}{q(z|x_1)}))$} \\
+    \hline
+    CVAE & 21.203 & \textbf{22.486} & \textbf{12.748} & -- & \textbf{56.852} \\
+    JMVAE & 23.877 & 26.695 & 26.658 & 37.726 & 81.190 \\
+    MVAE-Q & 34.719 & 38.090 & 34.978 & 44.269 & 101.223 \\
+    MVAE & \textbf{19.478} & 25.899 & 18.443 & \textbf{16.822} & 73.885 \\
+    MVAE19 & -- & -- & -- & -- & 71.824 \\
+    \bottomrule
+\end{tabular}
+\caption{Average variance of log importance weights for three marginal probabilities, estimated by importance sampling from $q(z|x_1)$. 1000 importance samples were used to approximate the variance. The lower the variance, the better quality the inference network.}
+\label{table:x_variances}
+\end{table}
+\paragraph{Effect of number of ELBO terms} In the MVAE training paradigm, there is a hyperparameter $k$ that controls the number of sampled ELBO terms to approximate the intractable objective. To investigate its importance, we vary $k$ from 0 to 50 and for each, train a MVAE19 on CelebA. We find that increasing $k$ has little effect on data log-likelihood but reduces the variance of the importance distribution defined by the inference networks. In practice, we choose a small $k$ as a tradeoff between computation and a better importance distribution. 
+% See supplement for more details.
+
+\begin{figure}
+\centering
+  \begin{subfigure}[b]{\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{images/chapter3/legend.pdf}
+  \end{subfigure}
+  \begin{subfigure}[b]{.32\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{images/chapter3/mnist.pdf}
+    \caption{Dynamic MNIST}
+  \end{subfigure}
+  \begin{subfigure}[b]{.32\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{images/chapter3/fashion.pdf}
+    \caption{FashionMNIST}
+  \end{subfigure}
+  \begin{subfigure}[b]{.32\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{images/chapter3/multi.pdf}
+    \caption{MultiMNIST}
+  \end{subfigure}
+  \caption{\textit{Effects of supervision level}. We plot the level of supervision as the log number of paired examples shown to each model. For MNIST and FashionMNIST, we predict the target class. For MultiMNIST, we predict the correct string representing each digit. We compare against a suite of baselines composed of models in relevant literature and commonly used classifiers. MVAE consistently beats all baselines in the \textit{middle region} where there is both enough data to fit a deep model; in the fully-supervised regime, MVAE is competitive with feedforward deep networks. See supplement for accuracies.}
+  \label{fig:weaksup_prediction}
+\end{figure}
+
+\subsection{Weakly Supervised Learning}
+For each dataset, we simulate incomplete supervision by randomly reserving a fraction of the dataset as multi-modal examples. The remaining data is split into two datasets: one with only the first modality, and one with only the second. These are shuffled to destroy any pairing. We examine the effect of supervision on the predictive task $p(x_2|x_1)$, e.g.~predict the correct digit label, $x_2$, from an image $x_1$. For the MVAE, the total number of examples shown to the model is always fixed -- only the proportion of complete bi-modal examples is varied. We compare the performance of the MVAE against a suite of baseline models: (1) supervised neural network using the same architectures (with the stochastic layer removed) as in the MVAE; (2) logistic regression on raw pixels; (3) an autoencoder trained on the full set of images, followed by logistic regression on a subset of paired examples; we do something similar for (4) VAEs and (5) RBMs, where the internal latent state is used as input to the logistic regression; finally (6) we train the JMVAE ($\alpha=0.01$ as suggested in \cite{suzuki2016joint}) on the subset of paired examples. Figure~\ref{fig:weaksup_prediction} shows performance as we vary the level of supervision. For MultiMNIST, $x_2$ is a string (e.g. ``6 8 1 2") representing the numbers in the image. We only include JMVAE as a baseline since it is not straightforward to output raw strings in a supervised manner.
+
+We find that the MVAE surpasses all the baselines on a middle region when there are enough paired examples to sufficiently train the deep networks but not enough paired examples to learn a supervised network. This is especially emphasized in FashionMNIST, where the MVAE equals a fully supervised network even with two orders of magnitude less paired examples (see Figure~\ref{fig:weaksup_prediction}). Intuitively, these results suggest that the MVAE can effectively learn the joint distribution by bootstrapping from a larger set of uni-modal data. A second observation is that the MVAE almost always performs better than the JMVAE. This discrepancy is likely due to directly optimizing the marginal distributions rather than minimizing distance between several variational posteriors. We noticed empirically that in the JMVAE, using the samples from $q(z|x,y)$ did much better (in accuracy) than samples from $q(z|x)$.
+
+\begin{figure}
+\centering
+    \begin{subfigure}[b]{.49\linewidth}
+        \includegraphics[width=\linewidth]{images/chapter3/vision1_small}
+        \caption{Edge Detection and Facial Landscapes}
+    \end{subfigure}
+    \begin{subfigure}[b]{.49\linewidth}
+        \includegraphics[width=\linewidth]{images/chapter3/colorization}
+        \caption{Colorization}
+    \end{subfigure}
+    \begin{subfigure}[b]{.49\linewidth}
+        \includegraphics[width=\linewidth]{images/chapter3/fill_in_blank}
+        \caption{Fill in the Blank}
+    \end{subfigure}
+    \begin{subfigure}[b]{.49\linewidth}
+        \includegraphics[width=\linewidth]{images/chapter3/watermark}
+        \caption{Removing Watermarks}
+    \end{subfigure}
+    \caption{\textit{Learning Computer Vision Transformations:} (a) 4 ground truth images randomly chosen from CelebA along with reconstructed images, edges, and facial landscape masks; (b) reconstructed color images; (c) image completion via reconstruction; (d) reconstructed images with the watermark removed. }
+    \label{fig:vision:images}
+\end{figure}
+
+\section{Case study: Computer Vision Applications}
+We use the MVAE to learn image transformations (and their inverses) as conditional distributions. In particular, we focus on colorization, edge detection, facial landmark segmentation, image completion, and watermark removal. The original image is itself a modality, for a total of six.
+
+To build the dataset, we apply ground-truth transformations to CelebA. For \textit{colorization}, we transform RGB colors to grayscale. For \textit{image completion}, half of the image is replaced with black pixels. For \textit{watermark removal}, we overlay a generic watermark. To extract edges, we use the Canny detector \cite{canny1987computational} from Scikit-Image \cite{van2014scikit}. To compute facial landscape masks, we use dlib \cite{king2009dlib} and OpenCV \cite{bradski2000opencv}.
+
+We fit a MVAE with 250 latent dimensions and $k {=} 1$. We use Adam with a $10^{-4}$ learning rate, a batch size of 50, $\lambda_{i} = 1$ for $i=1, ..., N$, $\beta$ annealing for 20 out of 100 epochs. Figure~\ref{fig:vision:images} shows samples showcasing different learned transformations. In Figure~\ref{fig:vision:images}a we encode the original image with the learned encoder, then decode the transformed image with the learned generative model. We see reasonable reconstruction, and good facial landscape and edge extraction. In Figs.\ref{fig:vision:images}b, \ref{fig:vision:images}c, \ref{fig:vision:images}d we go in the opposite direction, encoding a transformed image and then sampling from the generative model to reconstruct the original.
+The results are again quite good: reconstructed half-images agree on gaze direction and hair color, colorizations are reasonable, and all trace of the watermark is removed.
+(Though the reconstructed images still suffer from the same blurriness that VAEs do \cite{zhao2017towards}.)
+
+\section{Case study: Machine Translation}
+% \begin{minipage}{\textwidth}
+%   \centering
+%   \begin{minipage}[h!]{0.49\textwidth}
+%     \centering
+%       \includegraphics[width=\linewidth]{weaksup/translation.pdf}
+%       \label{fig:translation_weaksup}
+%   \end{minipage}
+%   \hfill
+%   \begin{minipage}[b]{0.49\textwidth}
+%     \centering
+%     \small
+%     \begin{tabular}{c|c}
+%       \toprule
+%       Dataset Size & Test log $p(x)$ \\
+%       \hline
+%       133 & $-558.88 \pm 3.56$ \\
+%       665 & $-494.76 \pm 4.18$\\
+%       1330 & $-483.23 \pm 5.81$\\
+%       6650 & $-478.75 \pm 3.00$\\
+%       13300 & $-478.04 \pm 4.95$\\
+%       133000 & $-478.12 \pm 3.02$\\
+%       \bottomrule
+%     \end{tabular}
+%   \end{minipage}
+%   \captionof{figure}{\textit{Weakly supervised translation.} We vary the number of paired examples shown to MVAE. With only 1\% of examples being aligned (about 1.3K examples or 7 on the log scale), we see close to equal performance to full supervision. Performance is measured by the log likelihood on a held-out test set, approximated by sampling. Measurements are averaged over 3 runs using 100 samples.}
+% \end{minipage}
+\begin{table}[h!]
+\centering
+\begin{tabular}{l|l}
+    \toprule
+    Num. Aligned Data (\%) & Test log $p(x)$ \\
+    \hline
+    133 (0.1\%) & $-558.88 \pm 3.56$ \\
+    665 (0.5\%) & $-494.76 \pm 4.18$\\
+    1330 (1\%) & $-483.23 \pm 5.81$\\
+    6650 (5\%) & $-478.75 \pm 3.00$\\
+    13300 (10\%) & $-478.04 \pm 4.95$\\
+    133000 (100\%) & $-478.12 \pm 3.02$\\
+    \bottomrule
+\end{tabular}
+\caption{\textit{Weakly supervised translation.} Log likelihoods on a test set, averaged over 3 runs. Notably, we find good performance with a small fraction of paired examples.}
+\label{table:translation_weaksup}
+\end{table}
+
+As a second case study we explore machine translation with weak supervision -- that is, where only a small subset of data consist of translated sentence pairs.
+Many of the popular translation models \cite{vaswani2017attention} are fully supervised with millions of parameters and trained on datasets with tens of millions of paired examples.
+Yet aligning text across languages is very costly, requiring input from expert human translators.
+Even the unsupervised machine translation literature relies on large bilingual dictionaries, strong pre-trained language models, or synthetic datasets \cite{lample2017unsupervised, artetxe2017unsupervised, ravi2011deciphering}. These factors make weak supervision particularly intriguing.
+
+We use the English-Vietnamese dataset (113K sentence pairs) from IWSLT 2015 and treat English (en) and Vietnamese (vi) as two modalities.
+We train the MVAE with 100 latent dimensions for 100 epochs ($\lambda_{\textup{en}} = \lambda_{\textup{vi}} = 1$). We use the RNN architectures from \cite{bowman2015generating} with a maximum sequence length of 70 tokens. As in \cite{bowman2015generating}, word dropout and KL annealing are crucial to prevent latent collapse.
+
+\begin{table}[h]
+\centering
+\scriptsize
+\begin{tabular}{ l|l }
+  \toprule
+  \textbf{Type} & \textbf{Sentence} \\
+  % \bottomrule
+  % $x_{\textup{en}} \sim p(x_{\textup{en}}|z_0)$ & i'm not kidding . \\
+  % $x_{\textup{vi}} \sim p(x_{\textup{vi}}|z_0)$ & \foreignlanguage{vietnamese}{tôi không nói đùa .} \\
+  % $\textsc{Google}(x_{\textup{vi}})$ & i am not joking . \\
+  % \hline
+  % $x_{\textup{en}} \sim p(x_{\textup{en}}|z_0)$ & And as you can see , this is a very powerful effect of word of mouth . \\
+  % $x_{\textup{vi}} \sim p(x_{\textup{vi}}|z_0)$ & \foreignlanguage{vietnamese}{và một trong những điều này đã xảy ra với những người khác , và chúng} \\
+  % & \foreignlanguage{vietnamese}{tôi đã có một số người trong số các bạn đã từng nghe về những điều này .} \\
+  % $\textsc{Google}(x_{\textup{vi}})$ & and one of these has happened to other people, and we've had \\
+  % & some of you guys already heard about this . \\
+  % $x_{\textup{en}} \sim p(x_{\textup{en}}|z_0)$ & this is a photograph of my life . \\
+  % $x_{\textup{vi}} \sim p(x_{\textup{vi}}|z_0)$ & \foreignlanguage{vietnamese}{Đây là một bức ảnh .} \\
+  % $\textsc{Google}(x_{\textup{vi}})$ & this is a photo . \\
+  % \bottomrule
+  $x_{\textup{en}} \sim p_{\textup{data}}$ & this was one of the highest points in my life. \\
+  $x_{\textup{vi}} \sim p(x_{\textup{vi}}|z(x_{\textup{en}}))$ & \foreignlanguage{vietnamese}{Đó là một gian tôi vời của cuộc đời tôi.} \\
+  $\textsc{Google}(x_{\textup{vi}})$ & It was a great time of my life. \\
+  % \hline
+  % $x_{\textup{en}} \sim p_{\textup{data}}$ & do you know what love is ? \\
+  % $x_{\textup{vi}} \sim p(x_{\textup{vi}}|z(x_{\textup{en}}))$ & \foreignlanguage{vietnamese}{Đó yêu của những ?} \\
+  % $\textsc{Google}(x_{\textup{vi}})$ & that's love ?\\
+  \hline
+  $x_{\textup{en}} \sim p_{\textup{data}}$ & the project's also made a big difference in the lives of the people . \\
+  $x_{\textup{vi}} \sim p(x_{\textup{vi}}|z(x_{\textup{en}}))$ & \foreignlanguage{vietnamese}{tôi án này được ra một Điều lớn lao cuộc sống của chúng người sống chữa hưởng .} \\
+  % & \foreignlanguage{vietnamese}{sống chữa hưởng .} \\
+  $\textsc{Google}(x_{\textup{vi}})$ & this project is a great thing for the lives of people who live and thrive . \\
+  \bottomrule
+  % $x_{\textup{vi}} \sim p_{\textup{data}}$ & \foreignlanguage{vietnamese}{Đó là thời điểm tuyệt vọng nhất trong cuộc đời tôi .} \\
+  % $x_{\textup{en}} \sim p(x_{\textup{en}}|z(x_{\textup{vi}}))$ & this is the most bad of the life . \\
+  % $\textsc{Google}(x_{\textup{vi}})$ & it was the most desperate time in my life . \\
+  % \hline
+  $x_{\textup{vi}} \sim p_{\textup{data}}$ & \foreignlanguage{vietnamese}{trước tiên , tại sao chúng lại có ấn tượng xấu như vậy ?} \\
+  $x_{\textup{en}} \sim p(x_{\textup{en}}|z(x_{\textup{vi}}))$ & first of all, you do not a good job ? \\
+  $\textsc{Google}(x_{\textup{vi}})$ & First, why are they so bad? \\
+  \hline
+  $x_{\textup{vi}} \sim p_{\textup{data}}$ & \foreignlanguage{vietnamese}{Ông ngoại của tôi là một người thật đáng <unk> phục vào thời ấy .} \\
+  $x_{\textup{en}} \sim p(x_{\textup{en}}|z(x_{\textup{vi}}))$ & grandfather is the best experience of me family . \\
+  $\textsc{Google}(x_{\textup{vi}})$ & My grandfather was a worthy person at the time . \\
+  \bottomrule
+\end{tabular}
+% (1) ``paired" reconstructions using $z_0 \sim q(z|x_{\textup{en}}, x_{\textup{vi}})$,
+\caption{Examples of (1) translating English to Vietnamese by sampling from $p(x_{\textup{vi}}|z)$ where $z \sim q(z|x_{\textup{en}})$, and (2) the inverse. We use Google Translate (\textsc{Google}) to compute ground-truth translations.}
+\label{table:translation_examples}
+\end{table}
+
+With only 1\% of aligned examples, the MVAE is able to describe test data almost as well as it could with a fully supervised dataset (Table \ref{table:translation_weaksup}). With 5\% aligned examples, the model reaches maximum performance. Table~\ref{table:translation_examples} shows examples of translation forwards and backwards between English and Vietnamese. See supplement for more examples. We find that many of the translations are not extremely faithful but interestingly capture a close interpretation to the true  meaning. While these results are not competitive to state-of-the-art translation, they are remarkable given the very weak supervision. Future work should investigate combining MVAE with modern translation architectures (e.g.~transformers, attention).
+
+\section{Related Work}
+\label{sec:related_work}
+
+Given \textit{two} modalities, $x_{1}$ and $x_{2}$, many variants of VAEs \cite{kingma2013auto, kingma2014semi}  have been used to train generative models of the form $p(x_{2} | x_{1})$, including conditional VAEs (CVAE) \cite{sohn2015learning} and conditional multi-modal autoencoders (CMMA) \cite{pandey2017variational}. Similar work has explored using hidden features from a VAE trained on images to generate captions, even in the weakly supervised setting \cite{pu2016variational}. Critically, these models are not bi-directional. We are more interested in studying models where we can condition interchangeably. For example, the BiVCCA \cite{wang2016deep} trains two VAEs together with interacting inference networks to facilitate two-way reconstruction. However, it does not attempt to directly model the joint distribution, which we find empirically to improve the ability of a model to learn the data distribution.
+
+Several recent models have tried to capture the joint distribution explicitly. \cite{suzuki2016joint} introduced the joint multi-modal VAE (JMVAE), which learns $p(x_{1}, x_{2})$ using a joint inference network, $q(z|x_{1}, x_{2})$. To handle missing data at test time, the JMVAE collectively trains $q(z|x_{1}, x_{2})$ with two other inference networks $q(z|x_{1})$ and $q(z|x_{2})$. The authors use ELBO with two additional divergence terms to minimize the distance between the uni-modal and the multi-modal distributions. Unfortunately, the JMVAE trains a new inference network for each multi-modal subset, which we have previously argue to be intractable in the general setting.
+
+Most recently, \cite{vedantam2017generative} introduce another objective for the bi-modal VAE, which they call the \textit{triplet ELBO}. Like the MVAE, their model's joint inference network $q(z|x_{1}, x_{2})$ combines variational distributions using a product-of-experts rule. Unlike the MVAE, the authors report a two-stage training process: using complete data, fit $q(z|x_{1}, x_{2})$ and the decoders. Then, freezing $p(x_{1}|z)$ and $p(x_{2}|z)$, fit the uni-modal inference networks, $q(z|x_{1})$ and $q(z|x_{2})$ to handle missing data at test time. Crucially, because training is separated, the model has to fit 2 new inference networks to handle all combinations of missing data in stage two. While this paradigm is sufficient for two modalities, it does not generalize to the truly multi-modal case. To the best of our knowledge, the MVAE is the first deep generative model to explore more than two modalities efficiently. Moreover, the single-stage training of the MVAE makes it uniquely applicable to weakly-supervised learning.
+
+Our proposed technique resembles established work in several ways. For example, PoE is reminiscent of a restricted Boltzmann machine (RBM), another latent variable model that has been applied to multi-modal learning \cite{ngiam2011multimodal, srivastava2012multimodal}. Like our inference networks, the RBM decomposes the posterior into a product of independent components. The benefit that a MVAE offers over a RBM is a simpler training algorithm via gradient descent rather than requiring contrastive divergence, yielding faster models that can handle more data. Our sub-sampling technique is somewhat similar to denoising \cite{vincent2008extracting, ngiam2011multimodal} where a subset of inputs are ``partially destructed" to encourage robust representations in autoencoders. In our case, we can think of ``robustness" as capturing the true marginal distributions.
+
+\section{Conclusion}
+We introduced a multi-modal variational autoencoder with a new training paradigm that learns a joint distribution and is robust to missing data. By optimizing the ELBO with multi-modal and uni-modal examples, we fully utilize the product-of-experts structure to share inference network parameters in a fashion that scales to an arbitrary number of modalities. We find that the MVAE matches the state-of-the-art on four bi-modal datasets, and shows promise on two real world datasets.

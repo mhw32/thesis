@@ -1,0 +1,685 @@
+\section{Introduction}
+\label{sec:introduction}
+In the last chapter, we investigated the scalability of deep inference with respect to a growing number of data modalities and missing data. Another aspect to the scalability of inference is sample efficiency. Optimizing the ELBO requires computing the gradient of an expectation term, which cannot be evaluated in closed form. Rather, we approximate it with sampling. For instance, in the VAE, we utilize the reparameterization trick \cite{kingma2013auto,rezende2014stochastic} to transform samples from the prior for estimation. For expectations of complex expressions, we may benefit from drawing multiple samples to reduce variance. For instance, the importance weighted autoencoder (IWAE) \cite{burda2015importance} derives a tighter bound on Equation~\ref{eq:marg} using multiple samples. However, additional samples comes at the cost of computation: each additional sample impacts the memory and running time for both the forward and backward pass. For even sophisticated hardware with gigabytes of random-access memory, IWAE is usually limited to fewer than 10 samples. In this chapter, we study a new algorithm for more scalable sampling for use in deep inference.
+
+A wide class of problems in science and engineering can be solved by gradient-based optimization of function expectations.
+This is especially prevalent in machine learning \cite{schulman2015gradient},  including variational inference \cite{ranganath2014black, rezende2014stochastic} and reinforcement learning \cite{silver2014deterministic}.
+On the face of it, problems of this nature require solving an intractable integral.
+Most practical approaches instead use Monte Carlo estimates of expectations and their gradients.
+These techniques are unbiased but can suffer from high variance when sample size is small---one unlikely sample in the tail of a distribution can heavily skew the final estimate.
+% \rdh{Different estimates from what? I think you can say this more crisply.}
+A simple way to reduce variance is to increase the number of samples; however the computational cost grows quickly. We would like to reap the positive benefits of a larger sample size using as few samples as possible. With a fixed computational budget, how do we choose samples?
+
+A large body of work studies reducing variance in sampling, with the most popular in machine learning being  reparameterizations for some continuous distributions \cite{kingma2013auto,jang2016categorical} and control variates to adjust for estimated error \cite{mnih2014neural,weaver2001optimal}.
+These techniques sample i.i.d.~but perhaps it is possible to choose correlated samples that are more \textit{representative} of their underlying distribution?
+Several such non-independent sampling approaches have been proposed in statistics.
+%There are several examples from statistics on the practicality of non-i.i.d sampling; for example, a simple strategy is sampling without replacement, which is forced to be ``representative" by covering the domain more quickly.
+% commonly used when drawing from a finite population. \s{$k$ samples without replacement are more representative than with replacement because there can never be duplicates.}
+We investigate \textit{antithetics}, where for every sample we draw, we include a negatively correlated sample to minimize the distance between sample and population moments.
+% \s{imprecise/incorrect statement i think}. \s{for example, if one sample is much larger than the mean, we will attempt to balance it with one that is much smaller}
+
+The key challenges in applying antithetic sampling to modern machine learning are (1) ensuring that antithetic samples are correctly distributed such that they provide unbiased estimators for Monte Carlo simulation, and (2) ensuring that sampling is differentiable to permit gradient-based optimization.
+% \s{key challenge: make sure these samples have the right statistics so that they are still usable in monte carlo schemes and provide unbiased estimators.}
+We focus on stochastic variational inference and explore using antithetics for learning the parameters for a deep generative model. %instead of sampling i.i.d.~from the variational posterior, we use an antithetic strategy.
+Critically, our method of antithetic sampling is differentiable and can be composed with reparametrizations of the underlying distributions to provide a fully differentiable sampling process. This yields a simple and low variance way to optimize the parameters of the variational posterior.
+
+Concisely, our contributions are as follows: We review a method to to generate Gaussian variates with known sample moments, then apply it to antithetics, and generalize it to other families using deterministic transformations. Seocnd, we show that differentiating through the sampling computation improves variational inference. Finally, we show that training VAEs with antithetic samples improves learning across objectives, posterior families, and datasets.
+
+\section{Preliminaries}
+\label{sec:background}
+
+Recall the learning objective for a latent variable model is to maximize the likelihood of the data (the ``evidence"), $\log p_\theta(x)$. This is intractable so we optimize the evidence lower bound (ELBO) instead:
+\begin{align}
+    \log p_\theta(x) & \geq \mathbf{E}_{q_\phi(z|x)}[\log \frac{p_\theta(x,z)}{q_\phi(z|x)}]\label{eqn:elbo}
+    % &= \mathbf{E}_{q_\phi(z|x)}[\log p_\theta(x|z)] - \nonumber \\
+    % &\qquad \textup{KL}[\log q_\phi(z|x) || \log p(z)] \label{eqn:elbo-2}
+\end{align}
+% where KL represents the Kullback-Leibner divergence.
+The VAE \cite{kingma2013auto,rezende2014stochastic} is an example of one such generative model where $p_\theta(x|z)$ and $q_\phi(z|x)$ are deep neural networks used to parameterize a simple likelihood.
+%As Equation~\ref{eqn:elbo} is a random objective, we can treat it as stochastic optimization.
+
+\begin{comment}
+\paragraph{Other Lower Bounds}
+
+\cite{burda2015importance} proposed a popular variant of the ELBO that is a tighter bound on $\log p(x)$, denoted as the IWAE:
+
+\begin{equation}
+    \mathbf{E}_{z_1, ..., z_k \sim q_\phi(z|x)}[\log \frac{1}{k} \sum_{i=1}^{k} \frac{p_\theta(x,z_i)}{q_\phi(z_i|x)}]
+\label{eqn:iwae}
+\end{equation}
+
+Many applications have found the IWAE to give better results than the ELBO.
+
+\paragraph{Flexible Posteriors}
+
+The choice of a Gaussian posterior may not be expressive enough to capture complex distributions (e.g.~multiple modes). \cite{rezende2015variational} improve the flexibility using \textit{normalizing flows} \cite{tabak2010density, tabak2013family}, a technique that applies a series of $T$ invertible transformations $h^{(t)}, t = 1, ..., T$ to samples $z^{(0)}$ from $q_\theta(z|x)$. As a result, the final transformed sample, $z^{(T)}$ comes from a more complex distribution.% To score samples, we choose $h: \mathbf{R}^d \rightarrow \mathbf{R}^d$ carefully such that we can compute the Jacobian-determinant in closed form.
+We adjust the objective accordingly:
+
+\begin{align}
+    \log p(x) &\geq \mathbf{E}_{z^{(0)} \sim q(z^{(0)}|x)}[\log \frac{p(x,z^{(T)})}{q(z^{(T)}|x)}]
+\end{align}
+
+where $q(z^{(T)}|x) = q(z^{(0)}|x) - \log | \det \frac{\partial h^{(t)}}{\partial z^{(t-1)}} |$. \cite{tomczak2016improving} introduces a second family of flows that are \textit{volume preserving}, meaning that the Jacobian-determinant equals 1.
+
+\end{comment}
+
+% Combining flows and smart sampling could lead to better exploration of the new posterior. We will show that matching moments can help learning for a wider family of distributions using flows.
+
+Since $\phi$ can impact the ELBO (though not the true marginal likelihood it lower bounds), we jointly optimize over  $\theta$ and $\phi$.
+The gradients of the ELBO objective are:
+\begin{align}
+    \nabla_\theta \textup{ELBO}(\theta, \phi) &= \mathbf{E}_{z \sim q_\phi(z|x)}[\nabla_\theta \log p_\theta(x,z)] \label{eqn:elbo_gradient_theta} \\
+    \nabla_\phi \textup{ELBO}(\theta, \phi) &= \nabla_\phi \mathbf{E}_{z \sim q_\phi(z|x)}[\log \frac{p_\theta(x,z)}{q_\phi(z|x)}]
+    \label{eqn:elbo_gradient_phi}
+\end{align}
+Equation~\ref{eqn:elbo_gradient_theta} can be directly estimated using Monte Carlo. However, as it stands, Equation~\ref{eqn:elbo_gradient_phi} is difficult to approximate as we cannot distribute the gradient inside the expectation. If we constrain $q_\phi(z|x)$ to certain families, we can reparameterize.
+
+% In this section, we present some terminology and summarize the main ideas behind stochastic optimization of functions with respect to \textit{continuous} distributions. Let $x \in \mathbf{R}^{d}$ be a vector of $d$ observable variables and $z \in \mathbf{R}^{l}$ be a vector of $l$ stochastic latent \s{why latent?} variables. We can define an arbitrary function of both variables, $f_{\phi,\theta}(x, z)$, with parameters $\theta$ and $\phi$. Typically, we consider maximizing the following objective:
+
+% \begin{equation}
+%     \mathcal{L}(\phi, \theta) = \mathbf{E}_{z \in Q_{\phi}} [f_{\phi,\theta}(x, z)]
+% \label{eqn:stochastic_opt}
+% \end{equation}
+% \s{missing dependence on $x$}
+
+% where $Q$ is a continuous distribution over $z$ parameterized by $\phi$ with a probability density function denoted by $q_\phi(z)$. We assume that $f_{\phi,\theta}(x, z)$ and $q_\phi(z)$ are differentiable with respect to their parameters. To optimize $\mathcal{L}(\phi, \theta)$, we wish to rely on gradient descent, requiring us to efficiently compute the following:
+
+% \begin{equation}
+%     \nabla_{\phi, \theta} \mathcal{L}(\phi, \theta) = \mathbf{E}_{z \in Q_\phi}[\nabla_{\phi, \theta} f_{\phi,\theta}(x, z)]
+% \label{eqn:gradient_opt}
+% \end{equation}
+
+% Given that the domain of $Q_\phi$ can be infinite, $\mathcal{L}(\phi, \theta)$ is intractable to evaluate, and by consequence, to optimize. As a workaround, we settle for approximating the expectation via unbiased Monte Carlo estimates. We now discuss the most popular class of estimators for a subset of continuous distributions.
+
+Reparameterization refers to isolating sampling from the gradient computation graph \cite{kingma2013auto,rezende2014stochastic}. If we can sample $z \sim q_\phi(z|x)$ by applying a deterministic function $z = g_\phi(\epsilon): \mathbf{R}^{d} \rightarrow \mathbf{R}^{d}$ to sampling from an unparametrized distribution, $\epsilon \sim R$, then we can rewrite Equation~\ref{eqn:elbo_gradient_phi} as:
+\begin{equation}
+    \nabla_\phi \textup{ELBO}(\theta, \phi) = \mathbf{E}_{\epsilon \sim R}[\nabla_z \log\frac{p_\theta(x,z(\epsilon))}{q_\phi(z(\epsilon)|x)} \nabla_\phi g_\phi(\epsilon)]
+\label{eqn:gradient_reparam}
+\end{equation}
+
+which can now be estimated in the usual manner. As an example, if $q_\phi(z|x)$ is a Gaussian, $N(\mu, \sigma^2)$ and we choose $R$ to be $N(0, 1)$, then $g(\epsilon) = \epsilon * \sigma + \mu$.
+% \rdh{confusing because you just said generically $\epsilon \sim R$ -- say here R is a standard normal}
+% \ndg{is this notation right?}
+% \mwu{made more explicit}
+% With reparameterization, maximizing the ELBO is \textit{equivalent} to a stochastic optimization problem (where $Q = q_\phi(z|x)$ and $f(x) = \log p_\theta(x,z) - \log q_\phi(z|x)$). Provided a method of drawing samples from $q$, we can use it to efficiently estimate Equation~\ref{eqn:elbo_gradient_theta} and Equation~\ref{eqn:gradient_reparam}.
+% We show below the benefit of doing so using \emph{representative} samples.
+
+% \subsection{Stochastic Optimization}
+
+% Variational inference can be viewed as a specific instance of a broader area of study: stochastic optimization. We can generalize the variational posterior $q_\phi(z|x)$ to a generic distribution $Q$ and the log importance weight as a generic function $f$.
+
+% \ndg{it doesn't make sense to me to formulate it this broadly, because we are only really interested in the case where $Q$ has params that we want gradient wrt....}
+
+% Then generally, the problem of interest is of the form:
+
+% \begin{equation}
+%     \min_{\theta} \mathbf{E}_{x\sim Q}[f_{\theta}(x)] = \min_{\theta} \int f_{\theta}(x)dQ(x)
+%     \label{eqn:stochastic_opt}
+% \end{equation}
+
+% where $f$ is a smooth differentiable function with parameters $\theta$, and $x$ is a function input taken from some distribution $Q$. We are interested in directly minimizing the expectation of $f$. However, because the support of $Q$ can be infinite, evaluation is in general, intractable. Instead, we hope to approximate the expectation by sampling. The gradients with respect to $\theta$ are then given by:
+
+% \begin{equation}
+%     \mathbf{E}_{x\sim Q}[\nabla_\theta f_\theta(x)] \approx \frac{1}{k}\sum_{i=1}^{k} Q(x_i)\nabla_\theta f_\theta(x_i)
+%     \label{eqn:approx_opt_func}
+% \end{equation}
+% \ndg{this equation is true, but misleading for the VI case, where we can't move the gradient inside the expectation without re-param...}
+
+% where $x_i \sim Q(x), i=1,...,k$. Notice that Equation~\ref{eqn:approx_opt_func} is exactly the form of Equations~\ref{eqn:elbo_gradient_theta} and \ref{eqn:gradient_reparam}. A sufficiently large variance in Equation~\ref{eqn:approx_opt_func} can lead to ineffective optimization.
+
+\subsection{Antithetic Sampling}
+Normally, we sample i.i.d.~from $q_\phi(z|x)$ and $R$ to approximate Equations~\ref{eqn:elbo_gradient_theta} and \ref{eqn:gradient_reparam}, respectively. However, drawing correlated samples could reduce variance in our estimation. Suppose we are given $k$ samples $z_1, z_2, ..., z_{k} \sim q_\phi(z|x)$. We could choose a second set of samples $z_{k+1}, z_{k+2},  ..., z_{2k} \sim q_\phi(z|x, z_1, ..., z_k)$ such that $z_{i+k}$ is somehow the ``opposite" of $z_{i}$. Then, we can write down a new estimator using both sample sets. For example, Equation~\ref{eqn:elbo_gradient_theta} can be approximated by:
+% \ndg{doing it as an estimator of expectation objective is ok, but not for the gradient (because of moving the gradient inside)}
+\begin{equation}
+\frac{1}{2k}\sum_{i=1}^{k} \nabla_\theta \log p_\theta(x, z_i) + \nabla_\theta \log p_\theta(x, z_{i+k})
+\label{eqn:opt_antithetic}
+\end{equation}
+Assuming $z_{k+1}, ..., z_{2k}$ is marginally distributed according to $q_\phi(z|x)$, Equation~\ref{eqn:opt_antithetic} is unbiased. Moreover, if $q_\phi(z|x)$ is near symmetric, the variance of this new estimator will be cut significantly. But what does ``opposite'' mean? One idea is to define ``opposite" as choosing $z_{k+i}$ such that the moments of the combined sample set $z_1, ..., z_{2k}$ match the moments of $q_\phi(z|x)$. Intuitively, if $z_i$ is too large, then choosing $z_{k+i}$ to be too small can help rebalance the sample mean, reducing first order errors. Similarly, if our first set of samples is too condensed at the mode, then choosing antithetic samples with higher spread can stabilize the variance closer to its expectation. However, sampling $z_{k+1}, ..., z_{2k}$ with particular sample statistics in mind is a difficult challenge. To solve this, we first narrow our scope to Gaussian distributions, and later extend to other distribution families.
+%We begin by re-introducing a statistical method to draw i.i.d. normal samples with a specified sample mean and variance.
+
+%If $Q$ is close to symmetric, the variance of this new estimator can be cut by a significant fraction while remaining unbiased. Depending on how $x_{k+1}, ..., x_{2k}$ are drawn, the sample moments of the $2k$ samples will approximately match the moments of $Q$.
+
+% \s{i would merge this with VAE section. breaks the flow. you want to transition from stochastic optimization / monte carlo to how to generate these samples.}
+
+% We now briefly discuss two more recent advances with VAEs useful in our own experiments.
+
+% \s{mention somewhere that we start with gaussians, then will extend to other distributions}
+
+\section{Constrained Sampling Problem}
+\label{sec:methods}
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.35\columnwidth]{images/chapter4/algo_pic.pdf}
+    \caption{An illustration of Marsaglia's solution to the constrained sampling problem in two dimensions: build a $(k-1)$-dimensional sphere by intersecting a hyperplane and a $k$-dimensional sphere (each representing a contraint). Generating $k$ samples is equivalent to uniformly sampling from the perimeter of the circle.}
+    \label{fig:algo}
+\end{figure}
+
+% \s{the idea of matching moments is not necessarily obvious to readers. in fact, not entirely clear that's the best thing to do either. so we need some text justifying this approach} If $Q$ is close to symmetric, . Depending on how $x_{k+1}, ..., x_{2k}$ are drawn, the sample moments of the $2k$ samples will approximately match the moments of $Q$.
+
+% \s{convince readers matching moments is a good idea first}
+
+% \s{as a warmup, might be worth explaining how to match the mean. }
+We present a constrained sampling problem: given a Gaussian distribution with population mean $\mu$ and population variance $\sigma^2$, we wish to generate $k$ samples $x_1, ..., x_k \sim N(\mu, \sigma^2)$ subject to the conditions:
+%
+\begin{align}
+    \frac{1}{k}\sum_{i=1}^{k} x_i &= \eta  \label{eqn:constraint1}\\
+    \frac{1}{k}\sum_{i=1}^{k} (x_i - \eta)^2 &= \delta^2 \label{eqn:constraint2}
+\end{align}
+%
+where the constants $\eta$ and $\delta^2$ are given and represent the sample mean and sample variance. In other words, how can we draw samples from the correct marginal distribution conditioned on matching desired \emph{sample} moments? For example, we might wish to match sample and population moments: $\eta=\mu$ and $\delta=\sigma$.
+% \s{tell people we'll often want $\eta=\mu=$, .., make sure readers realiza there's a difference between sample and population moments.}
+
+Over forty years, there have been a handful of solutions. We review the algorithm introduced by \cite{marsaglia1980c69}. 
+% In our experiments, we reference a second algorithm by \cite{pullin1979generation, cheng1984generation}, which is detailed in the supplement. 
+We chose \cite{marsaglia1980c69} due its simplicity, low computational overhead, and the fact that it makes the fewest random choices of proposed solutions.
+
+\paragraph{Intuition} Since $x_1, ..., x_k$ are independent, we can write the joint density function:
+\begin{equation}
+    p(x_1, ..., x_k) = (2\pi \sigma^2)^{-\frac{k}{2}}e^{-\frac{1}{2\sigma^2}\sum_i(x_i - \mu)^2}
+\label{eqn:joint_density}
+\end{equation}
+%Furthermore, we rewrite the constraints as:
+%\begin{align}
+%    \sum_{i=1}^{k} x_i = k\eta \label{eqn:constraint1}\\
+%    \sum_{i=1}^{k} (x_i - \eta)^2 = \gamma^2 \label{eqn:constraint2}
+%\end{align}
+%where $\gamma = \sqrt{k}\delta$. In this form,
+We can interpret Equation~\ref{eqn:constraint1} as a hyperplane and Equation~\ref{eqn:constraint2} as the surface of a sphere in $k$ dimensions. Let $\mathcal{X}$ be the set of all points $(x_1, ..., x_k) \in \mathbf{R}^k$ that satisfy the above constraints. Geometrically, we can view $\mathcal{X}$ as the intersection between the hyperplane and $k$-dimensional sphere, i.e., the surface of a $(k-1)$ dimensional sphere (e.g. a circle if $k=2$).
+
+We make the following important observation: the joint density (Equation~\ref{eqn:joint_density}) is constant for all points in $\mathcal{X}$. To see this, we can write the following:
+\begin{equation*}
+\begin{split}
+    \sum_{i}(x_i - \mu)^2 &= \sum_i(x_i - \eta)^2  + 2(\eta - \mu)\sum_i(x_i - \eta) + k(\eta - \mu)^2 \\
+    &= \sum_i(x_i - \eta)^2 + k(\eta - \mu)^2 \\
+    &= k \delta^2 + k(\eta - \mu)^2
+	%  &= \gamma^2 + k(\eta - \mu)^2
+\end{split}
+\label{eqn:proof1}
+\end{equation*}
+where $\sum_i(x_i - \eta) = \sum_i(x_i) - k\eta = 0$ by Equation~\ref{eqn:constraint1}. Plugging this into the density function, rewrite Equation~\ref{eqn:joint_density} as:
+\begin{equation}
+    p(x_1, ..., x_k) = (2\pi \sigma^2)^{-\frac{k}{2}}e^{-\frac{1}{2\sigma^2}(k \delta^2 + k(\eta - \mu)^2)}
+\label{eqn:joint_pdf_2}
+\end{equation}
+Equation~\ref{eqn:joint_pdf_2} is independent of $x_1, ..., x_k$. For any $(\eta, \delta, \mu, \sigma)$, the density for every $x \in \mathcal{X}$ is constant. In other words, the conditional distribution of $x_1, ..., x_k$ given that $x_1, ..., x_k \in \mathcal{X}$ is the uniform distribution over $\mathcal{X}$. Surprisingly, it does \textit{not} depend on $\mu$ or $\sigma$.
+Therefore, to solve the constrained sampling problem, we need only be able to sample uniformly from the surface of a $(k-1)$ dimensional sphere.
+
+\paragraph{Marsaglia's Solution}
+More precisely, we can generate the required samples $\textbf{x} = (x_1, ..., x_k)$ from a point $\textbf{z} = (z_1, ..., z_{k-1})$ uniformly distributed on the unit sphere in $\mathbf{R}^{k-1}$ centered at the origin by solving the linear system:
+\begin{equation}
+    \textbf{x} = k^{\frac{1}{2}}\delta\textbf{z}B + \eta \textbf{v}
+\label{eqn:linear_system}
+\end{equation}
+where $\textbf{v} = (1, 1, ..., 1)$ is a $k$ dimensional vector of ones and $B$ is a $(k-1)$ by $k$ matrix such that the rows of $B$ form an orthonormal basis with the null space of $\textbf{v}$ i.e. we choose $B$ where $BB^{t} = I$ and $B\textbf{v}^{t} = 0$, which happens to satisfy our constraints:
+\begin{align}
+    \textbf{x}\textbf{v}^t &= k\eta \label{eqn:newc1}\\
+    (\textbf{x} - \eta\textbf{v})(\textbf{x} - \eta\textbf{v})^t = k\delta^2\textbf{z}BB^t\textbf{z}^t &= k\delta^2 \label{eqn:newc2}
+\end{align}
+As $\textbf{z}$ is uniformly distributed over the unit $(k-1)$ sphere, Equation~\ref{eqn:newc1} and \ref{eqn:newc2} guarantee that $\textbf{x}$ is uniformly distributed in $\mathcal{X}$. We can generate $\textbf{z}$ by sampling $(\epsilon_1, ..., \epsilon_{k-1}) \sim N(0, 1)$ and setting $z_i = \epsilon_i / \sum_i \epsilon_i^2$. As in \cite{marsaglia1980c69}, we set $B$ to \textsc{RowNormalize}$(A)$ where $A$ is defined as
+
+\begin{center}
+$\begin{bmatrix}
+1-k & 1 & 1 & . & . & . & 1 & 1& 1\\
+0 & 2-k & 1 & . & . & . & 1 &1 & 1\\
+0 &  0 & 3-k & . & . & . & 1 & 1 & 1\\
+. &  &  &  &  &  &  & & .\\
+ .&  &  &  &  &  &  & & .\\
+. &  &  &  &  &  &  & &  .\\
+0 & 0 & 0  & . & . & . &-2 & 1 & 1\\
+0 & 0  & 0 & . & . &. & 0 &  -1 & 1
+\end{bmatrix}$
+\end{center}
+
+and \textsc{RowNormalize} is a procedure that divides each row vector in $A$ by the sum of the elements in that row. We summarize Marsaglia's algorithm in Algorithm~\ref{algo:marsaglia} and its properties in Proposition~\ref{prop:marsaglia}.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.5\textwidth]{images/chapter4/algo-marsaglia.png}
+    \caption{The \texttt{MarsagliaSample} algorithm.}
+    \label{algo:marsaglia}
+\end{figure}
+
+\begin{prop}
+    For any $k>2$, $\mu \in \mathbf{R}$ and $\sigma^2>0$, if $\eta \sim N(\mu, \frac{\sigma^2}{k})$ and $\frac{(k-1)\delta^2}{\sigma^2} \sim \chi^2_{k-1}$ and $\boldsymbol{\epsilon} = \epsilon_1, ..., \epsilon_{k-1} \sim N(0, 1)$ i.i.d., then the generated samples $x_1, ..., x_k = \textsc{MarsagliaSample}(\boldsymbol{\epsilon}, \eta, \delta^2,k)$ are independent normal variates sampled from $N(\mu, \sigma^2)$ such that $\frac{1}{k}\sum_i x_i = \eta$ and $\frac{1}{k}\sum_i(x_i - \eta)^2 = \delta^2$.
+    \label{prop:marsaglia}
+\end{prop}
+\begin{sketch}We provide a full proof in Section~\ref{sec:proof:anti}. For a sketch, let $\mathbf{x} = (x_1, ..., x_k)$ such that $x_i \sim N(\mu, \sigma^2)$ i.i.d. Compute sample statistics $\eta, \delta^2$ from $\mathbf{x}$ as defined in Equation~\ref{eqn:sample_stats}. Consider the joint distribution over samples and sample moments:
+\begin{equation*}
+    p(\mathbf{x},\eta,\delta^2) = p(\eta,\delta^2)p(\mathbf{x}|\eta,\delta^2).
+\end{equation*}
+We make two observations: first, $\eta,\delta^2$, as defined, are drawn from $p(\eta,\delta^2)$. Second, as hinted above, $p(\mathbf{x}|\eta,\delta^2)$ is the uniform distribution over a $(k-1)$-sphere, which Marsaglia shows us how to sample from. Thus, any samples $\mathbf{x'} \sim p(\mathbf{x}|\eta=\eta,\delta^2=\delta^2)$ will be distributed as $\mathbf{x}$ is (marginally), in other words i.i.d. Gaussian.
+\end{sketch}
+
+% \s{add some discussion on how to incorporate the population mean and variance. one way to generate $k$ i.i.d. gaussian with specific population mean and variance is to "`randomly pick the constraints"', and then use marsaglia. specifically, sample $\eta$, $\delta^2$ from gaussina, chi-square ...}
+
+As implied in Proposition~\ref{prop:marsaglia}, if we happen to know the population mean $\mu$ and variance $\sigma^2$ (as we do in variational inference given the explicit form of the approximate posterior), we could generate $k$ i.i.d. Gaussian variates by sampling $\eta \sim N(\mu, \frac{\sigma^2}{k})$ and $\frac{(k-1)\delta^2}{\sigma^2} \sim \chi^2_{k-1}$, and passing $\eta$, $\delta^2$ to \textsc{MarsagliaSample}.
+% Formally we have the following corollary to Proposition \ref{prop:marsaglia}:
+% \s{check $k>2$?}
+% \begin{corollary}
+%     For any $k>2$, $\mu \in \mathbf{R}$ and $\sigma^2>0$, if $\eta \sim N(\mu, \frac{\sigma^2}{k})$ and $\frac{(k-1)\delta^2}{\sigma^2} \sim \chi^2_{k-1}$ and $\boldsymbol{\epsilon} = \epsilon_1, ..., \epsilon_{k-1} \sim N(0, 1)$, then the generated samples $x_1, ..., x_k = \textsc{MarsagliaSample}(\boldsymbol{\epsilon}, \eta, \delta^2,k)$ are independent normal variates sampled from $N(\mu, \sigma^2)$.
+% \label{prop:marsaglia2}
+% \end{corollary}
+
+\section{Constrained Antithetic Sampling}
+
+We might be inclined to use \textsc{MarsagliaSample} to directly generate samples with some fixed \emph{deterministic} $\eta=\mu$ and $\delta=\sigma$. However, Proposition~\ref{prop:marsaglia} holds only if the desired sample moments $\eta,\delta$ are \emph{random} variables. If we choose them deterministically, we can no longer guarantee the correct marginal distribution for the samples, thus precluding their use for Monte Carlo estimates. Instead, what we can do is compute $\eta$ and $\delta^2$ from i.i.d. samples from $N(\mu, \sigma^2)$, derive antithetic sample moments, and use \textsc{MarsagliaSample} to generate a second set of samples.
+
+More precisely, given a set of $k$ independent normal variates $(x_1, ..., x_k) \sim N(\mu, \sigma^2)$, we would like to generate a new set of $k$ normal variates $(x_{k+1}, ..., x_{2k})$ such that the combined sample moments match the population moments, $\frac{1}{2k}\sum_{i=1}^{2k} x_i = \mu$ and $\frac{1}{2k}\sum_{i=1}^{2k} (x_i -\mu)^2 = \sigma^2$. We call the second set of samples $(x_{k+1}, ..., x_{2k})$ \textit{antithetic} to the first set. To begin, we compute sample statistics from the first set:
+\begin{align}
+    \eta &= \frac{1}{k}\sum_{i=1}^{k} x_i & \delta^2 &= \frac{1}{k}\sum_{i=1}^{k} (x_i -\mu)^2
+    \label{eqn:sample_stats}
+\end{align}
+Note that  $\eta,\delta$ are random variables, satisfying $\eta \sim N(\mu, \frac{\sigma^2}{k})$ and $\frac{(k-1)\delta^2}{\sigma^2} \sim \chi^2_{k-1}$. Ideally, we would want the second set to come from an ``opposing" $\eta'$ and $\delta'$. To choose $\eta'$ and $\delta'$, we leverage the \textit{inverse CDF transform}: given the cumulative distribution function (CDF) for a random variable $X$, denoted $F_X$, we can define a uniform variate $Y= F_X(X)$. The \textit{antithetic} uniform variable is then $Y' = 1 - Y$, which upon application of the inverse CDF function, is mapped back to a properly distributed antithetic variate $X' = F^{-1}_X(Y')$. Crucially, $X$ and $X'$ have the same marginal distribution, but are not independent.
+
+Let $F_{\eta}$ represent a Gaussian CDF and $F_{\delta}$ represent a Chi-squared CDF. We can derive $\eta'$ and $\delta'$ as:
+\begin{align}
+    \eta' &= F^{-1}_\eta(1 - F_\eta(\eta)) \\
+    \frac{(k-1)(\delta')^2}{\sigma^2} &= F^{-1}_\delta\left(1 - F_\delta \left(\frac{(k-1)\delta^2}{\sigma^2}\right)\right) \label{eq:inversechi}
+\end{align}
+Crucially, $\eta', \delta'$ chosen this way are random variables with the correct marginal distributions, i.e., $\eta' \sim N(\mu, \frac{\sigma^2}{k})$ and $\frac{(k-1)(\delta')^2}{\sigma^2} \sim \chi^2_{k-1}$. knowing $\eta', \delta'$, it is straightforward to generate antithetic samples with \textsc{MarsagliaSample}. We summarize the algorithm in Algorithm~\ref{alg:antithetic} and its properties in Proposition~\ref{prop:antithetic}.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.5\textwidth]{images/chapter4/algo-antithetic.png}
+    \caption{The \texttt{AntitheticSample} algorithm.}
+    \label{alg:antithetic}
+\end{figure}
+% \begin{algorithm}[h!]
+% \SetAlgoLined
+% \caption{\textsc{AntitheticSample}}
+% \KwData{i.i.d. samples $(x_1, ..., x_k) \sim N(\mu, \sigma^2)$; i.i.d. samples $\boldsymbol{\epsilon} = (\epsilon_1, ..., \epsilon_{k-1}) \sim N(0, 1)$; Population mean $\mu$ and variance $\sigma^2$; Number of samples $k \in \mathbf{N}$.} % \s{k}
+% \KwResult{A set of $k$ samples $(x_{k+1}, x_{k+2}, ..., x_{2k})$ marginally distributed as $N(\mu, \sigma^2)$ with sample mean $\eta'$ and sample standard deviation $\delta'$.}
+
+% $v = k -1$\;
+% $\eta = \frac{1}{k}\sum_{i=1}^k x_i$\;
+% $\delta^2 = \frac{1}{k}\sum_{i=1}^k (x_i - \eta)^2$\;
+% % $\eta' = 2\mu - \eta$\;
+% $\eta' = F^{-1}_\eta(1 - F_\eta(\eta))$\;
+% $\lambda = v\delta^2/\sigma^2$\;
+% $\lambda' = F^{-1}_\delta(1 - F_\delta(\lambda))$\;
+% % $\lambda' = v(2(1 - \frac{3}{16v} - \frac{7}{512v^2} + \frac{231}{8192v^3}) - (\frac{\lambda}{v})^{1/4})^4$\;
+% $(\delta')^2 = \lambda'\sigma^2/v$\;
+% $(x_{k+1}, ..., x_{2k}) = \textsc{MarsagliaSample}(\boldsymbol{\epsilon}, \eta', (\delta')^2, k)$\;
+% Return $(x_{k+1}, ..., x_{2k})$\;
+% \label{alg:antithetic}
+% \end{algorithm}
+
+% \s{not sure we can make any claim on the sample variance. even if the chi-square thing was exact, not clear to me the variance would match exactly}
+\begin{prop}
+Given $k - 1$ i.i.d samples $\boldsymbol{\epsilon} = (\epsilon_1, ..., \epsilon_{k-1}) \sim N(0, 1)$, $k$ i.i.d. samples $\boldsymbol{x} = (x_1, ..., x_k) \sim N(\mu, \sigma^2)$, let $(x_{k+1}, ..., x_{2k}) = \textsc{AntitheticSample}(\boldsymbol{x}, \boldsymbol{\epsilon}, \mu, \sigma^2, k)$ be the generated antithetic samples. Then:
+\begin{enumerate}
+\item $x_{k+1}, ..., x_{2k}$ are independent normal variates sampled from $N(\mu, \sigma^2)$.
+\item The combined sample mean $\frac{1}{2k}\sum_{i=1}^{2k}x_i$ is equal to the population mean $\mu$.
+\item The sample variance of $x_{k+1}, ..., x_{2k}$ is anticorrelated with the sample variance of $x_1, ..., x_k$.
+\end{enumerate}
+%i.i.d. but each $x_{k+i}$ is negatively correlated with $x_{i}$. The combined sample mean $\frac{1}{2k}\sum_{i=1}^{2k}x_i = \mu$ will match the population mean. The combined sample variance $\frac{1}{2k}\sum_{i=1}^{2k}(x_i-\mu)^2 = \sigma^2$ will match population variance.
+% The total sample variance $\frac{1}{2k}\sum_{i=1}^{2k}(x_i - \mu)^2 \approx \sigma^2$ will be close to the population variance (depending on the normal approximation error).
+\label{prop:antithetic}
+\end{prop}
+\begin{proof}
+The first property follows immediately from Proposition~\ref{prop:marsaglia}, as by construction $\eta', \delta'$ have the correct marginal distribution. Simple algebra shows that the inverse Gaussian CDF transform simplifies to $\eta' = 2 * \mu - \eta$, giving the desired relationship $\eta/2 + \eta'/2 = \mu $. The third property follows from Equation \ref{eq:inversechi}.
+\end{proof}
+
+Since both sets of samples share the same (correct) marginal distribution, $x_1, ..., x_{2k}$ can be used to obtain unbiased Monte Carlo estimates.
+% \s{try to make the proof more precise, actually write down the expectation with respect to the joint. in the proof, use previous result that the samples have the right marginal distribution. that is the key step..}
+\begin{prop}
+    %For a normal distribution $Q$, given $x_1, ..., x_k \sim Q$ i.i.d. samples and $x_{k+1}, ..., x_{2k}$ i.i.d. antithetic samples drawn using $\textsc{AntitheticSample}$, the combined set $(x_1, ..., x_{2k})$ forms an unbiased estimator, $\frac{1}{2k}\sum_{i=1}^{2k} f_\theta(x_i)Q(x_i)$ for a generic expectation, $\mathbf{E}_{x \sim Q}[f_\theta(x)]$ of a function $f$.
+		Given $k - 1$ i.i.d samples $\boldsymbol{\epsilon} = (\epsilon_1, ..., \epsilon_{k-1}) \sim N(0, 1)$, $k$ i.i.d. samples $\boldsymbol{x} = (x_1, ..., x_k) \sim N(\mu, \sigma^2)$, let $(x_{k+1}, ..., x_{2k}) = \textsc{AntitheticSample}(\boldsymbol{x}, \boldsymbol{\epsilon}, \mu, \sigma^2, k)$ be the generated antithetic samples. Then $\frac{1}{2k} \sum_{i=1}^{2k} f(x_i)$ is an unbiased estimator of $\mathbf{E}_{x \sim N(\mu, \sigma^2)}[f(x)]$.
+ \label{unbiased}
+\end{prop}
+
+\begin{proof}
+Let $q(x_1, \cdots, x_k, x_{k+1}, \cdots, x_{2k})$ denote the joint distribution of the $2k$ samples. Note the two groups of samples $(x_1, ..., x_k)$ and $(x_{k+1}, ..., x_{2k})$ are not independent. However,
+\begin{align*}
+\mathbf{E}_{(x_1, \cdots, x_k, x_{k+1}, \cdots, x_{2k}) \sim q} \left[ \frac{1}{2k} \sum_{i=1}^{2k} f(x_i) \right] = \\
+\frac{1}{2k} \sum_{i=1}^{2k} \mathbf{E}_{x_i \sim q_i(x_i)} \left[f(x_i) \right] = \mathbf{E}_{x \sim N(\mu, \sigma^2)}[f(x)]
+\end{align*}
+because by assumption and Proposition~\ref{prop:antithetic}, each $x_i$ is marginally distributed as $N(\mu, \sigma^2)$.
+%We can define an estimator using only the first $k$ samples, $e_1 = \frac{1}{k}\sum_{i=1}^{k} f_\theta(x_i)Q(x_i)$. By definition, $e_1$ is unbiased. Similarly, we define a second estimator using the next $k$ samples, $e_2 = \frac{1}{k}\sum_{i=k+1}^{2k} f_\theta(x_i)Q(x_i)$. By Proposition~\ref{prop:antithetic}, $x_{k+1}, ..., x_{2k} \sim Q$ are marginally distributed according to $Q$. Therefore, $e_2$ is also unbiased. We write the combined estimator as $\frac{1}{2k}\sum_{i=1}^{2k} f_\theta(x_i)Q(x_i) = \frac{e_1}{2} + \frac{e_2}{2}$. A linear combination of two unbiased estimators is unbiased.
+\label{prop:test}
+\end{proof}
+
+\subsection{Approximate Antithetic Sampling}
+
+If $F_\eta$ and $F_\delta$ were well-defined and invertible, we could use Algorithm~\ref{alg:antithetic} as is, with its good guarantees. On one hand, since $\eta$ is normally distributed, the inverse CDF transform simplifies to:
+\begin{equation}
+    \eta' = 2 * \mu - \eta
+\label{eqn:inversecdf_mean}
+\end{equation}
+However, there is no general closed form expression for $F^{-1}_\delta$. Our options are then to either use a discretized table of probabilities or approximate the inverse CDF. Because we desire differentiability, we choose to use a normal approximation to $F_{\delta}$.
+
+\paragraph{Antithetic Hawkins-Wixley}
+
+\cite{canal2005normal} surveys a variety of normal approximations, all of which are a linear combination of $\chi^2$ variates to a power root. We choose to use \cite{hawkins1986note} as (P1) it is an even power, (P2) it contains only 1 term involving a random variate, and (P3) is shown to work better for smaller degrees of freedom (smaller sample sizes). We derive a closed form for computing $\delta'$ from $\delta$ by combining the normal approximation with Equation~\ref{eqn:inversecdf_mean}. We denote this final transform as the \textit{antithetic Hawkins-Wixley transform}:
+\begin{equation}
+    \lambda' = v(2(1 - \frac{3}{16v} - \frac{7}{512v^2} + \frac{231}{8192v^3}) - (\frac{\lambda}{v})^{1/4})^4
+    \label{eqn:anti_approx}
+\end{equation}
+where $\lambda \sim \chi^2_{v}$ with $v$ being the degree of freedom. Therefore, if we set $\lambda = (k-1)\delta^2/\sigma^2 \sim \chi^2_{k-1}$ and $v = k - 1$, then we can derive $(\delta')^2 = \lambda'\sigma^2/(k-1)$ where $\lambda'$ is computed as in Equation~\ref{eqn:anti_approx}, whose derivation can be found in Section~\ref{sec:proof:anti}.
+
+P1 is important as odd degree approximations e.g. \cite{wilson1931distribution} can result in a negative value for $\lambda'$ under small $k$. P2 is required to derive a closed form as most linear combinations do not factor. P3 is desirable for variational inference.
+
+To update Algorithm~\ref{alg:antithetic}, we swap the fourth line with Equation~\ref{eqn:inversecdf_mean} and the sixth line with Equation~\ref{eqn:anti_approx}.
+The first property in Proposition \ref{prop:antithetic} and therefore also Proposition \ref{unbiased} do not hold anymore: the approximate \textsc{AntitheticSample} has bias that depends on the approximation error in Equation~\ref{eqn:anti_approx}.
+%
+%We summarize the properties of the approximate antithetic sampler below:
+%\begin{prop}
+%Given $k - 1$ i.i.d samples $\boldsymbol{\epsilon} = (\epsilon_1, ..., \epsilon_{k-1}) \sim N(0, 1)$, $k$ i.i.d. samples $\boldsymbol{x} = (x_1, ..., x_k) \sim N(\mu, \sigma^2)$, the generated samples $(x_{k+1}, ..., x_{2k}) = \textsc{AntitheticSample}(\boldsymbol{x}, \boldsymbol{\epsilon}, \mu, \sigma^2, k)$ are i.i.d. but each $x_{k+i}$ is negatively correlated with $x_{i}$. The combined sample mean $\frac{1}{2k}\sum_{i=1}^{2k}x_i = \mu$ will match the population mean. The samples $x_1, ..., x_{2k}$ no longer form an unbiased estimator with error dependent on the approximation error in Equation~\ref{eqn:anti_approx}.
+%\label{prop:antithetic2}
+%\end{prop}
+In practice, we find the approximate \textsc{AntitheticSample} to be effective.
+From now on, when we refer to \textsc{AntitheticSample}, we refer to the approximate version. We refer to Figure~\ref{fig:demo} for an illustration of the impact of antithetics: sampling i.i.d. could result in skewed sample distributions that over-emphasize the mode or tails, especially when drawing very few samples. Including antithetic samples helps to ``stabilize" the sample distribution to be closer to the true distribution.
+
+
+\begin{figure}[h!]
+    \centering
+    \begin{subfigure}[b]{\columnwidth}
+        \includegraphics[width=\columnwidth]{images/chapter4/demo_legend.pdf}
+    \end{subfigure}
+    \begin{subfigure}[b]{.24\columnwidth}
+        \includegraphics[width=\columnwidth]{images/chapter4/demo8sample.pdf}
+        \caption{$k=8$}
+        \label{fig:demo8}
+    \end{subfigure}
+    \begin{subfigure}[b]{.24\columnwidth}
+        \includegraphics[width=\columnwidth]{images/chapter4/demo10sample.pdf}
+        \caption{$k=10$}
+        \label{fig:demo10}
+    \end{subfigure}
+    \begin{subfigure}[b]{.24\columnwidth}
+        \includegraphics[width=\columnwidth]{images/chapter4/demo20sample.pdf}
+        \caption{$k=20$}
+        \label{fig:demo20}
+    \end{subfigure}
+    \begin{subfigure}[b]{.24\columnwidth}
+        \includegraphics[width=\columnwidth]{images/chapter4/demo50sample.pdf}
+        \caption{$k=50$}
+        \label{fig:demo50}
+    \end{subfigure}
+    \caption{The effect of \textsc{AntitheticSample} in 1 dimension. We vary the number of samples $k$, and plot the true distribution (solid black line), a kernel density estimate (KDE) of the empirical distribution (dotted blue line) of $2k$ i.i.d. samples (blue), and a KDE of the empirical distribution (dashed red line) of $k$ i.i.d. samples (red) pooled with $k$ antithetic samples (orange).
+%    The ``+" and ``x" symbols in each figure represent the raw samples. With smaller $k$, the red curve is a much closer approximation of the black curve than its blue counterpart. As $k$ increases, both sampling techniques converge on the true distribution.
+    This snapshot was taken from the first epoch of training an AntiVAE on dynamic MNIST.}
+
+    % \rdh{I wonder whether a more schematic version of this can go earlier in the intro to motivate the intuition? also, make the lines thinker and the sample markers on the x axis a lot bigger so you can see them. also, it looks like the true distribution is different across the columns? (it's taller)}}
+        % \s{needs better captioning and legend. unclear what is shown. also not readable in black and white}
+    \label{fig:demo}
+\end{figure}
+
+% Alternatively, \cite{cheng1982use, cheng1984generation} proposes an antithetic sampling technique using \textsc{MatchMoments}. Given $X \sim N(\mu, \sigma^2)$, derive \textit{antithetic} moments from the moments of $X$. Largely, this involves applications of the inverse-CDF trick and normal approximations for non-normal variates, resulting in a second set of antithetic samples $X'$ such that when used in combination with $X$, should help reduce first order errors. In practice, we find the normal approximations to be poor, resulting in little difference in estimator quality. We find directly matching moments to be much simpler and more effective. \s{i don't understand this paragraph}
+
+% \ndg{is it at all feasible to have a theorem showing that variance of an expectation estimate will be strictly lower after matching moments (under some appropriately draconian assumptions)?}
+
+% \mwu{my gut instinct is that this depends a lot on the function in the expectation.}
+
+\section{Generalization to Other Families}
+\label{sec:generalization}
+
+% \s{be explicit about what you get here. you are not matching the moments of the resulting distribution. it's a bit of a weird thing..}
+
+Marsaglia's algorithm is restricted to distribution families that can be transformed to a unit sphere (primarily Gaussians), as are many similar algorithms \cite{cheng1984generation, pullin1979generation}. However, we can explore ``generalizing" \textsc{AntitheticSample} to a wider class of families by first antithetically sampling in a Gaussian distribution, then transforming its samples to samples from another family using a deterministic function, $g: \mathbf{R}^d \rightarrow \mathbf{R}^d$. Although we are not explicitly matching the moments of the derived distributions, we expect that transformations of more representative samples in an initial distribution may be more representative in the  transformed distribution. We now discuss a few candidates for $g(\cdot)$.
+
+\subsection{One-Liners}
+\cite{devroye1996random} presents a large suite of ``one line" transformations between distributions. We focus on three examples starting from a Gaussian to (1) Log Normal, (2) Exponential, and (3) Cauchy. Many additional transformations (e.g.~to Pareto, Gumbel, Weibull, etc.) can be used in a similar fashion. Let $F_x$ refer to the CDF of a random variable $x$. See Section~\ref{sec:proof:anti} for derivations.
+
+% \begin{figure}[h!]
+%     \centering
+%     \begin{subfigure}[b]{\columnwidth}
+%         \includegraphics[width=\columnwidth]{skematic2.pdf}
+%         \caption{}
+%         \label{fig:skematic2}
+%     \end{subfigure}
+%     \begin{subfigure}[b]{\columnwidth}
+%         \includegraphics[width=\columnwidth]{skematic3.pdf}
+%         \caption{}
+%         \label{fig:skematic3}
+%     \end{subfigure}
+%     \caption{Composition of a series of transformations on samples from $q(z|x)$. In (a), \textsc{MatchMoments} is applied prior to reparameterization so it escapes the backwards pass. In (b) \textsc{MatchMoments} is included in backpropagation. $g(z)$ represents a series of transformations e.g. one liners, flows, etc.}
+% \end{figure}
+
+
+\paragraph{Log Normal}$g(z) = e^z$ where $z \sim N(\mu, \sigma^2)$.
+% For this example, we can apply $g$ after \textsc{MatchMoments} and backpropagate.
+
+% \paragraph{Inverse CDF transform} More complex one liners (again) operate via the inverse CDF transform.  Let $F_x$ denote the CDF for a variable $x$, then $y = F_x(x)$ where $y \in U(0, 1)$. We can derive the inverse transformation $F_x^{-1}(y)$ by solving the system: $F_x(F_x^{-1}(y)) = y$. This allows us to map a Gaussian variate to a Uniform, which can then be mapped to many families.
+
+% With this, the variational posterior is no longer Gaussian: the computational flow becomes 1) sample from a unit Gaussian, 2) apply \textsc{MatchMoments}, 3) map to Uniform, 4) apply some $g$ to map to a final distribution. Thus, we no longer backpropagate through \textsc{MatchMoments}. \s{is there a way to do it with adjoints?}
+
+\paragraph{Exponential} Let $F_x(x) = 1 - \exp^{\lambda x}$ where $\lambda\in \mathbf{R}^d$ is a learnable parameter. Then $F_x^{-1}(y) = -\frac{1}{\lambda} \log y$. Thus, $g(u, \lambda) = -\frac{1}{\lambda} \log u$ where $u \in U(0, 1)$.
+
+\paragraph{Cauchy} Let $F_x(x) = \frac{1}{2} + \frac{1}{\pi}\arctan(\frac{x - x_0}{\gamma})$ where $x_0\in \mathbf{R}^d, \gamma\in \mathbf{R}^d$ are learnable parameters. Then $F_x^{-1}(y) = \gamma(\tan(\pi y) + x_0)$. Given $u \in U(0, 1)$, we define $g(u, x_0, \gamma) = \gamma(\tan(\pi u) + x_0)$.
+
+
+\subsection{Deeper Flows}
+One liners are an example of a simple flow where we know how to score the transformed sample. If we want more flexible distributions, we can apply normalizing flows (NF). A \textit{normalizing flow} \cite{rezende2015variational} applies $T$ invertible transformations $h^{(t)}, t = 1, ..., T$ to samples $z^{(0)}$ from a simple distribution, leaving $z^{(T)}$ as a sample from a complex distribution. A common normalizing flow is a linear-time transformation: $g(z) = z + u(h(w^{T}z + b))$ where $w\in \mathbf{R}^d, u\in \mathbf{R}^d, b\in \mathbf{R}$ are learnable parameters, and $h$ is a non-linearity. In variational inference, flows enable us to parameterize a wider set of posterior families.
+% This particular $g(\cdot)$ is easy to use as its Jacobian-determinant can be computed in closed form: $|\det \frac{\partial g}{\partial z}| = |1 + u^{T}h'(w^{T}z + b)w|$.
+
+We can also achieve flexible posteriors using volume-preserving flows (VPF), of which \cite{tomczak2016improving} introduced the Householder transformation: $g(z) = (I - 2\frac{v \cdot v^T}{\|v\|^2})z$ where $v \in \mathbf{R}^d$ is a trainable parameter. Critically, the Jacobian-determinant is 1.
+
+\begin{figure}
+    \centering
+    \includegraphics[width=0.5\textwidth]{images/chapter4/algo-antivae.png}
+    \caption{The AntiVAE inference algorithm.}
+    \label{algo:vae_forward}
+\end{figure}
+% often set to the output of a hidden layer in the inference network
+% \begin{algorithm}[h]
+% \SetAlgoLined
+% \caption{AntiVAE Inference}
+% \KwData{A observation $x$; number of samples $k \geq 6$; a variational posterior $q(z|x)$ e.g. a $d$-dimensional Gaussian, $N^d(\mu, \sigma^2)$.}
+% \KwResult{Samples $z^d_1,...,z^d_k\sim q_{\mu, \sigma}(z|x)$ that match moments.}
+% $\mu^d$, $\sigma^d =$\textsc{InferenceNetwork}$(x)$\;
+% $\mu = \normalfont\textsc{Flatten}(\mu^d)$\;
+% $\sigma = \normalfont\textsc{Flatten}(\sigma^d)$\;
+% $\epsilon_1, ..., \epsilon_{kd/2} \sim N(0, 1)$\;
+% $\boldsymbol{\xi} = \xi_1, ..., \xi_{\frac{kd}{2} - 1} \sim N(0, 1)$\;
+% \For{$i\gets 1$ \KwTo $kd/2$}{
+%     $y_i = \epsilon_i * \sigma + \mu$\;
+% }
+% $\boldsymbol{y} = (y_1, ..., y_{kd/2})$\;
+% $y_{\frac{kd}{2} + 1}, ..., y_{kd} = $\textsc{AntitheticSample}$(\boldsymbol{y}, \boldsymbol{\xi}, \mu, \sigma)$\;
+% $\boldsymbol{z} = (y_1, ..., y_{kd})$\;
+% $z^d_1, ..., z^d_k = \normalfont\textsc{UnFlatten}(\boldsymbol{z})$\;
+% Return $z^d_1, ..., z^d_k$\;
+% \label{algo:vae_forward}
+% \end{algorithm}
+
+\section{Differentiable Antithetic Sampling}
+
+% \s{now the issue is that reviewers will (correctly) say this is not new because it's in cheng's papers. i think we want to be explicit about what's new. we can probably claim we are the first to backprop through. we can claim we are the first to apply to variational inference. maybe the one-liners? anything else? anyways, i think some separate section with the new stsuff would be helpful. and if possible, i wouldn't tie it to the VAE case. explain the new stuff in the context of general stochastic optimization and variational inference. that will make it cleaner and more general. basically, try to distill what's new, and make a bigger deal out of it..}
+
+% \s{for example, explain how you would backprop through matchmoments, and with respect to what, and is it even differentiable (doesn't look differentiable to me..), etc.}
+
+% \ndg{i don't love starting at stochastic optimization in general, because what is cool here is that using matchmoments in elbo allows the gradient to be passed through (its a reparam). what do you think about focussing this section on VI? the flow is then: elbo estimated with samples from matchmoments+transform is still an unbiased lower bound estimate, because matchmoments is differentiable the elbo gradients can be simply derived (ala reparam), the computation can be done by AD.}
+Finally, we can use \textsc{AntitheticSample} to approximate the ELBO for variational inference.
+For a given observation $x \in p_\textup{data}$ from an empirical dataset, we write the antithetic gradient estimators as:
+\begin{equation}
+    \begin{split}
+        \nabla_\theta \textup{ELBO}(\theta, \phi) &\approx \frac{1}{2k}\sum_{i=1}^{k}[\nabla_\theta \log p_\theta(x, z_i) \\
+        & + \nabla_\theta \log p_\theta(x, z_{i+k}) ]\label{eqn:grad_anti1}
+    \end{split}
+\end{equation}
+\begin{equation}
+    \begin{split}
+        \nabla_\phi \textup{ELBO}(\theta, \phi) &\approx \frac{1}{2k}\sum_{i=1}^{k}[\nabla_{z} \log \frac{p_\theta(x, z_i(\epsilon))}{q_\phi(z_i(\epsilon)|x)}\nabla_\phi g_\phi(\epsilon_i) \\
+        & + \nabla_{z} \log \frac{p_\theta(x, z_{i+k}(\epsilon))}{q_\phi(z_{i+k}(\epsilon)|x)}\nabla_\phi g_\phi(\epsilon_{i+k})]\label{eqn:grad_anti2}
+    \end{split}
+\end{equation}
+where $(\epsilon_1, ..., \epsilon_k) \sim N(0, 1)$, $\boldsymbol{\xi} = (\xi_1, ..., \xi_{k-1})$, $\boldsymbol{z} = (z_1, ..., z_k) \sim q_\phi(z|x)$, and $(z_{k+1}, ..., z_{2k}) = \textsc{AntitheticSample}(\boldsymbol{z}, \boldsymbol{\xi}, \mu, \sigma^2, k)$. Optionally, $\boldsymbol{z} = \textsc{Transform}(\boldsymbol{z}, \alpha)$ where $\textsc{Transform}$ denotes any sample transformation(s) with parameters $\alpha$.
+
+Alternative variational bounds have been considered recently, including an importance-weighted estimator of the ELBO, or IWAE \cite{burda2015importance}. Antithetic sampling can be applied in a similar fashion, as also shown in~\cite{shu2019buffered}.
+
+Importantly, \textsc{AntitheticSample} is a special instance of a reparameterization estimator. Aside from samples from a parameter-less distribution (unit Gaussian), \textsc{AntitheticSample} is completely deterministic, meaning that it is differentiable with respect to the population moments $\mu$ and $\sigma^2$ by any modern auto-differentiation library.
+% \begin{figure}[h!]
+%     \begin{subfigure}[b]{0.49\columnwidth}
+%         \includegraphics[width=\columnwidth]{vae_trajectory.pdf}
+%         \caption{VAE}
+%         \label{fig:vae_traj}
+%     \end{subfigure}
+%     \begin{subfigure}[b]{0.49\columnwidth}
+%         \includegraphics[width=\columnwidth]{matchae_trajectory.pdf}
+%         \caption{AntiVAE}
+%         \label{fig:antivae_traj}
+%     \end{subfigure}
+% \caption{Trajectory of first 100 epochs for variational posteriors $q(z|x)$ for a fixed observation $x$ from dynamic MNIST with $|z| = 2$. With a fixed random seed, same weight initialization, and same number of random choices, we find that adding antithetic sampling finds a different local maxima.}
+% \rdh{hmm, i'm not sure what this is showing. first, are these exactly the same latent dimensions? why does the red mean? why is it significant that it finds a different local maxima (i.e. without characterizing what is special about these two maxima?}}
+% \label{fig:q_trajectory}
+% \end{figure}
+%This is special as usually, in variational inference, learning $\phi,\theta$ is isolated from the sample generation.
+Allowing backpropagation through \textsc{AntitheticSample} means that any free parameters are aware of the sampling strategy. Thus, including antithetics will change the optimization trajectory, resulting in a different variational posterior than if we had used i.i.d  samples alone. In Sec.~\ref{sec:results}, we show experimentally that \textit{most of the benefit} of differentiable antithetic sampling comes from being differentiable.
+
+% \mwu{its probably unbiased. need to add proof.}
+Algorithm~\ref{algo:vae_forward} summarizes inference in a VAE using differentiable antithetic sampling (denoted by AntiVAE). In our experiments, we compare Marsaglia's to a competing algorithm by Cheng \cite{cheng1982use}. We refer to this as AntiVAE (Cheng).
+To the best of our knowledge, the application of antithetic sampling to stochastic optimization, especially variational inference is novel. Both the application of \cite{marsaglia1980c69} to drawing antithetics and the extension of \textsc{AntitheticSample} to other distribution families by transformation is novel. This is also the first instance of differentiating through an antithetic sample generator.
+% \ndg{This stuff is hanging out of place...: \textsc{Flatten} reshapes a matrix of size $k$ by $d$ to a vector of $k * d$. \textsc{UnFlatten} is the inverse. With diagonal covariance, 1 sample from a $d$ dimensional Gaussian is equivalent to $d$ samples from a 1 dimensional Gaussian.}
+\begin{figure*}[t!]
+    \centering
+    \begin{subfigure}[b]{\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/elbo_legend.pdf}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.135\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/static_mnist_main_result.pdf}
+        \caption{static}
+        \label{fig:elbo_static_mnist}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.135\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/dynamic_mnist_main_result.pdf}
+        \caption{dynamic}
+        \label{fig:elbo_dynamic_mnist}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.135\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/fashion_mnist_main_result.pdf}
+        \caption{Fashion}
+        \label{fig:elbo_fashion_mnist}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.135\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/omniglot_main_result.pdf}
+        \caption{Omniglot}
+        \label{fig:elbo_omniglot}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.135\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/caltech_main_result.pdf}
+        \caption{Caltech}
+        \label{fig:elbo_caltech}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.135\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/freyfaces_main_result.pdf}
+        \caption{Frey}
+        \label{fig:elbo_freyfaces}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.135\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/histopathology_main_result.pdf}
+        \caption{Hist.}
+        \label{fig:elbo_histopathology}
+    \end{subfigure}
+\caption{A comparison of test log likelihoods over 500 epochs between VAE and AntiVAE. Transforming samples to match moments seems to have different degrees of effectiveness depending on the data domain. However, we find that the test ELBO with AntiVAE is almost always greater or equal to that of the VAE. This behavior is not sensitive to hyperparameters e.g. learning rate or MLP hidden dimension. For each subplot, we start plotting from epoch 20 to 500. We cannot resample observations in Caltech101, leading to overfitting.}
+\label{fig:learning_trajectory}
+\end{figure*}
+
+\begin{table*}[t!]
+\scriptsize
+\begin{tabular}{r|ccccccc}
+    Model & stat. MNIST & dyn. MNIST & FashionMNIST & Omniglot & Caltech  & Frey & Hist. \\
+    \toprule
+    VAE & -90.44 & -86.96 & -2819.13 & -110.65 & -127.26 & -1778.78 & -3320.37\\
+    AntiVAE & -89.74 & -86.94 & -2807.06 & \textbf{-110.13} & \textbf{-124.87} & -1758.66 & -3293.01 \\
+    AntiVAE (Cheng) & \textbf{-89.70} & \textbf{-86.93} & \textbf{-2806.71} & -110.39 &  -125.19 & \textbf{-1758.29} & \textbf{-3292.72}\\
+    \hline
+    VAE+IWAE & -89.78 & -86.71 & -2797.02 & \textbf{-109.32} & -123.99 & -1772.06 & -3311.23 \\
+    AntiVAE+IWAE & \textbf{-89.71} & \textbf{-86.62} & \textbf{-2793.01} & -109.48 & \textbf{-123.35} & \textbf{-1771.47} & \textbf{-3305.91}\\
+    \hline
+    VAE ($\log N$) & \textbf{-149.47} & -145.13 & -2891.75 & -164.01 & -269.51 & -1910.11 &  -3460.18 \\
+    AntiVAE ($\log N$) & -149.78 & \textbf{-141.76} & \textbf{-2882.11} & \textbf{-163.55} & \textbf{-266.82} & \textbf{-1895.15} & \textbf{-3454.54} \\
+    \hline
+    VAE (Exp.) & \textbf{141.95} & -140.91 & -2971.00 & -159.92 & -200.14 & -2176.83 & -3776.48 \\
+    AntiVAE (Exp.) & 141.98 & \textbf{-140.58} & \textbf{-2970.12} & \textbf{-158.15} & -\textbf{197.47} & \textbf{-2156.93} & \textbf{-3770.33} \\
+    \hline
+    VAE (Cauchy) & -217.69 & -217.53 & -3570.53 & -187.34 & -419.78 & -2404.24 & -3930.40 \\
+    AntiVAE (Cauchy) & \textbf{-215.89} & \textbf{-217.12} & \textbf{-3564.80} & \textbf{-186.02} & \textbf{-417.0} & \textbf{-2395.07} & \textbf{-3926.95} \\
+    \hline
+    VAE+10-NF & -90.07 & -86.93 & -2803.98 & -110.03 & -128.62 & -1780.61 & -3328.68 \\
+    AntiVAE+10-NF & \textbf{-89.77} & \textbf{-86.57} & \textbf{-2801.90} & \textbf{-109.43} & \textbf{-127.23} & \textbf{-1777.26} & \textbf{-3303.00}\\
+    \hline
+    VAE+10-VPF & -90.59 & -86.99 & -2802.65 & -110.19 & -128.87& -1789.18 & -3312.30 \\
+    AntiVAE+10-VPF & \textbf{-90.00} & \textbf{-86.59} & \textbf{-2797.05} & \textbf{-109.04} & \textbf{126.72} & \textbf{-1787.18} & \textbf{-3305.42}\\
+\end{tabular}
+\caption{Test log likelihoods between the VAE and AntiVAE under different objectives and posterior families (a higher number is better). Architecture and hyperparameters are consistent across models. AntiVAE (Cheng) refers to drawing antithetic sampling using an alternative algorithm to Marsaglia (see supplement). Results show the average over 5 independent runs with different random seeds. For measurements of variance, see supplement.}
+\label{table:results}
+\end{table*}
+
+\begin{figure*}[t!]
+    \begin{subfigure}[b]{0.16\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/sample_effect.pdf}
+        \caption{FashionMNIST}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.16\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/z_effect.pdf}
+        \caption{FashionMNIST}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.24\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/backprop_effect.pdf}
+        \caption{FashionMNIST}
+        \label{fig:discussion:c}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.24\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/backprop2_effect.pdf}
+        \caption{Histopathology}
+        \label{fig:discussion:d}
+    \end{subfigure}
+    \begin{subfigure}[b]{0.16\textwidth}
+        \includegraphics[width=\textwidth]{images/chapter4/backprop_analysis.pdf}
+        \caption{Histopathology}
+        \label{fig:discussion:e}
+    \end{subfigure}
+    \caption{(a) With more samples, the difference in $\log p(x)$ between AntiVAE and VAE approaches 0. (b) The benefit of antithetics varies directly with dimensionality. (c) Backpropagating through \textsc{AntitheticSample} is responsible for most of the improvement over i.i.d. sampling. However, even without it, antithetics outperforms VAE. (d) Similar observation in Histopathology. (e) Differentiable antithetics encourages sample diversity.}
+    \label{fig:discussion}
+\end{figure*}
+
+\section{Empirical Evaluation}
+\label{sec:experiments}
+
+% \s{does the approach help for evaluation (not optimization/learning)? let's say you have a pretrained model. you want to evaluate using multiple samples. is cheng better?}
+
+We compare performance of the VAE and AntiVAE on seven image datasets: static MNIST \cite{larochelle2011neural}, dynamic MNIST \cite{lecun1998gradient}, FashionMNIST \cite{xiao2017fashion}, OMNIGLOT \cite{lake2015human}, Caltech 101 Silhouettes \cite{marlin2010inductive}, Frey Faces\footnote{https://cs.nyu.edu/~roweis/data.html}, and Histopathology patches \cite{tomczak2016improving}. See supplement for details.
+
+In both VAE and AntiVAE, $q_\phi(z|x)$ and $p_\theta(x|z)$ are two-layer MLPs with 300 hidden units, Xavier initialization \cite{glorot2010understanding}, and ReLU. By default, we set $d=40$ and $k=8$ (i.e. 4 antithetic samples) and optimize either the ELBO or IWAE. For grayscale images, $p_\theta(x|z)$ parameterize a discretized logistic distribution as in \cite{kingma2016improved, tomczak2017vae}. The log variance from $p_\theta(x|z)$ is clamped between -4.5 and 0.0 \cite{tomczak2017vae}. We use Adam \cite{kingma2014adam} with a fixed learning rate of $3\cdot 10^{-4}$ and a mini-batch of 128. We train for 500 epochs. Test marginal log likelihoods are estimated via importance sampling using 100 i.i.d.~samples. 
+% See supplement for additional experiments where we vary architectures, measure runtimes, report variance over many runs, and more.
+Figure~\ref{fig:learning_trajectory} and Table~\ref{table:results} show test log likelihoods (over 5 runs). We summarize findings below:
+
+\paragraph{VAE versus AntiVAE} AntiVAE consistently achieves higher log likelihoods, usually by a margin of 2 to 5 log units. With FashionMNIST/Histopathology, the margin grows to as much as 30 log units. In the 3 cases that AntiVAE performs worse than VAE, the log-likelihoods are almost equal ($\leq$ 1 log unit). In Figure~\ref{fig:elbo_dynamic_mnist}, we see a case where, even when the final performance is equivalent, AntiVAE learns faster. We find similar behavior using a tighter IWAE bound or other posterior families defined by one liners and flows. With the latter, we see improvements of up to 25 log units. A better sampling strategy is effective regardless of the choice of objective and distributional family.
+
+% \paragraph{AntiVAE with one liners and flows}
+% The positive effect of antithetics extends to other posterior families. With one liners and both flow families,
+% \ndg{do we say anywhere that these experiments are VAEs with a different posterior approximating, $q$, family given by the corresponding flow?}
+
+% This is likely dependent on what the transformed distribution looks like. More complex distributions with multiple modes might benefit more from more principled sampling methods whereas others may fare just as well by drawing randomly.
+% \ndg{it feels like a figure, or some additional analyses would be useful for this result.}
+
+% \ndg{what's the runtime impact of momentmatch?}
+
+% \ndg{you should add momentmatch to pyro -- it'd be easy, work nicey with parallel sampling, and be nice to say its available...}
+
+% \subsection{Pathwise Derivatives in Simple Physics Experiments}
+
+% TODO.
+
+%\section{Discussion}
+%\label{sec:discussion}
+
+%We present more analysis on AntiVAE behavior as we vary experimental settings to gain an understanding of performance sensitivity (see Figure~\ref{fig:discussion}):
+
+%Figure~\ref{fig:discussion} illustrates more qualitative analysis of AntiVAE behavior as we vary experimental settings:
+
+\paragraph{As $k$ increases, the effect of antithetic sampling diminishes.}
+Figure~\ref{fig:discussion}a illustrates that as the number of samples $k \rightarrow \infty$, posterior samples will match the true moments of $q_\phi(z|x)$ regardless of the sampling strategy. But as $k\rightarrow 0$, the effectiveness grows quickly. We expect best performance at small (but not too small) $k$ where the normal approximation (Equation~\ref{eqn:anti_approx}) is decent and the value of antithetics is high.
+
+\paragraph{As $d$ increases, the effect of antithetic sampling grows.} Figure~\ref{fig:discussion}b illustrates that the importance of sampling strategy increases as the dimensionality grows due to an exponential explosion in the volume of the sample space. With higher dimensionality, we find antithetic sampling to be more effective.
+
+\paragraph{Backpropagating through antithetic sampling greatly improves performance.} From Figure~\ref{fig:discussion:c}, \ref{fig:discussion:d}, we see that most of the improvement from antithetics relies on differentiating through \textsc{AntitheticSample}. This is sensible as the model can adjust parameters if it is aware of the sampling strategy, leading to better optima. Even if we do not backpropagate through sampling (draw antithetic samples from $N(0, 1)$ followed by standard reparameterization), we will still find modest improvement over i.i.d.~sampling.
+We believe differentiability encourages initial samples to be more diverse. We measure the variance of the first $\frac{k}{2}$ samples (1) without antithetics, (2) with non-differentiable antithetics, and (3) with differentiable antithetics. Figure~\ref{fig:discussion}e shows that samples in (3) have consistently higher variance.
+
+\paragraph{AntiVAE runtimes are comparable.} We measure an average 0.004 sec. increase in wallclock time per step when adding in antithetics.
+
+\section{Conclusion}
+\label{sec:conclusion}
+We present a differentiable antithetic sampler for variance reduction, aimed at sample efficiency for deep inference in generative models like the VAE. A potential extension for future work is to apply a similar idea to reinforcement learning using pathwise derivatives~\cite{levy2018deterministic}.

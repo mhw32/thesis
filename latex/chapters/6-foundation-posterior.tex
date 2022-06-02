@@ -1,0 +1,348 @@
+Latent variable models are only one example in a rich class of graphical models used in practice. In this sense, the MetaELBO proposed in Section~\ref{chapter:metavae} is limited in applicability. However, the idea of twice-amortized inference can be more broadly used. In this next chapter, we will study a method based on masked language modeling to generate meta-amortized inference to larger class of probabilistic programs. 
+
+\section{Preliminaries}
+
+The primary goal of probabilistic programming is to enable practitioners from any domain to easily reason about random variables of interest \cite{gordon2014probabilistic,van2018introduction}.
+The main challenge is to build posterior inference algorithms that are both efficient for practical usage and universal -- working for any program that might be written. Many probabilistic programming languages (PPLs) have been developed \cite{goodman2012church,minka2012infer,dippl,mansinghka2014venture,depaoli2016just,tolpin2016design,narayanan2016probabilistic,salvatier2016probabilistic,tran2016edward,carpenter2017stan,ge2018turing,cusumano2019gen,bingham2019pyro,tehrani2020bean} each with inference approaches with strengths and weaknesses. Some require users to assist in the inference process by programmatically specifying conditional independencies \cite{bingham2019pyro} or hand-crafting variational distributions \cite{ritchie2015controlling,bingham2019pyro,cusumano2019gen}. Others place strong restrictions on what kinds of programs can be represented \cite{carpenter2017stan}.
+In this paper, we propose a complementary approach to scale inference for probabilistic programs. By treating a program as a constrained form of language with some additional nomenclature, we show that probabilistic inference can be viewed as masked language modeling \cite{vaswani2017attention,devlin2018bert}, a technique popular in natural language processing. Since little is assumed about the program, we need impose few constraints on users upfront. Further, the generality of treating inference as a text prediction problem naturally enables more advanced features, such as plating, with little additional work. We call this approach \textit{masked language inference}, or MLI.
+
+While MLI can be used to solve inference queries for a single program, it becomes more powerful when \textit{meta-amortized} (or twice-amortized)  to do inference across different queries \textit{and} programs. Success requires a dense set of programs that cover sufficient diversity for the meta-algorithm to generalize. Since this is not always obtainable, we propose \textit{program augmentations} to enlarge a small dataset of programs. The result of meta-amortized MLI on the augmented programs is a \textit{foundation posterior}: a large neural network trained to do inference across many probabilistic programs. In experiments, we find the foundation posterior to be capable of both zero-shot inference and variational fine-tuning: given a program from the test set, we can achieve higher quality using the foundation posterior as an initial distribution. Indeed, fine-tuning the foundation posterior gives the best performance, for a wide range of runtimes, for a set of standard STAN programs.
+
+% The rest of this paper is organized as follows. We provide some pertinent preliminaries in Section~\ref{sec:background}. In Section~\ref{sec:mli}, we describe MLI and show experiments for a variety of simple programs. In Sections~\ref{sec:meta} to \ref{sec:stan}, we apply MLI for meta-amortized inference, present our augmentation family, and construct the foundation posterior on the dataset of STAN programs. In Section~\ref{sec:related}, we relate our approach to prior work. Finally, in Section~\ref{sec:discussion}, we discuss limitations and future work.
+
+\begin{figure}[tb]
+    \centering
+    \includegraphics[width=0.9\textwidth]{images/chapter6/overview.png}
+    \caption{Masked language inference: treating a probabilistic program as a raw string, a large language model is trained to unmask latent variables conditioned on observed ones.}
+    \label{fig:overview}
+\end{figure}
+
+\section{Background}
+\label{sec:background}
+
+% We briefly review some of the important technical concepts before introducing the method.
+
+\paragraph{Probabilistic Programs}
+We assume a class of probabilistic programs without loops and such that every line assigns a value to a variable. We note that all finite loops can be ``unrolled'' into a program without loops. Our constraint primarily disallows probabilistic programs with undecided runtime. Later, we relax this assumption to support loops over conditionally independent variables where unrolling may not be practical.
+Variable assignment can take many different forms including sampling $x \sim \texttt{gaussian}(z, 1)$, direct assignment $x = z$, and function evaluation $x = \texttt{sqrt}(z)$. Importantly, we do not constrain what distributions and functions are allowed.
+
+\paragraph{Approximate Inference} 
+Let $p(x, z)$ be a joint distribution of latent variables $z$ and observed variables $x$. An inference query seeks to compute posterior beliefs $p(z|x) = \left(\frac{p(x,z)}{p(x)}\right)$ which is usually intractable as computing $p(x) = \int_z p(x,z) dz$ faithfully requires solving a difficult integral.
+So, we settle for approximate techniques. Markov Chain Monte Carlo (MCMC) \cite{hastings1970monte,gelfand1990sampling} and variational inference (VI) \cite{jordan1999introduction,wainwright2008graphical,blei2017variational} are two widely used examples. Focusing on the latter, VI introduces a family of tractable distributions $\mathcal{Q}$ over the latent variables to find the member $q^* \in \mathcal{Q}$ that minimizes the Kullback-Leibler (KL) divergence between itself and the exact posterior $q^*(z) = \argmin_q \textup{KL}\left(q(z) || p(z|x)\right)$. Once found, $q^*$ serves as a proxy for the true posterior.
+For probabilistic programs, $p(x,z)$ is easy to sample from (by simply executing the program) but difficult to score.
+In these cases, we apply a useful trick by optimizing $\textup{KL}(p||q)$ rather than $\textup{KL}(q||p)$:
+\begin{equation}
+\mathcal{L}_{\textup{comp}}(\phi) = \mathbf{E}_{p(x)}\left[ \textup{KL}\left( p(z|x) || q_\phi(z|x) \right) \right] = \mathbf{E}_{p(x,z)} \left[-\log q_\phi(z|x) \right] + \textup{constant}
+\label{eq:comp}
+\end{equation}
+Equation~\ref{eq:comp} is called compiled inference \cite{le2017inference}. Dropping the constant, the remaining expression is close to a supervised objective: choose the parameters of the distribution $q(z|x)$ that maximizes the likelihood of $(x,z) \sim p(x,z)$, samples from the probabilistic program.
+
+\paragraph{Masked Language Modeling}
+A seemingly unrelated technique is masked language modeling (MLM) \cite{devlin2018bert}, used widely by large language models like BERT \cite{devlin2018bert}. The MLM objective is a word prediction task \cite{taylor1953cloze}. Given an input sentence, each token has a probability of being replaced by a special mask token. The model then predicts the original token given the rest of the sentence.
+In slightly more notation, let $x = (t_1, \ldots, t_{i-1}, \texttt{<mask>}, t_{i+1}, \ldots, t_n)$ be a sequence of tokens that form a sentence where the $i$-th token was randomly masked. The label is then just $y = t_i$. (This presentation assumes only one token is masked for simplicity whereas in general, multiple tokens can be masked in a single sentence.) Then, the MLM objective is written as $\mathcal{L}_{\textup{mlm}} = \mathbf{E}_{p(x)}\left[ \log p(y|x) \right]$ where $\log p(\cdot|\cdot)$ is cross entropy applied to softmax beliefs over the full vocabulary.
+
+\section{Masked Language Inference}
+\label{sec:mli}
+
+We now connect approximate inference to MLM. Suppose we are given a single probabilistic program; we wish to do inference, but do not know apriori which variables in the program are observed and which are latent. During evaluation, an inquirer might hand you observations for any subset of the variables and present you with inference queries for the remaining unknown variables. To solve this challenge we aim to find a dataset of observed and latent assignments from which we can train a model to perform inference. We leverage the programitself to generate such a dataset. To do this, we edit the program slightly: For every line (which by design must be a variable assignment), we add an annotation with the value that the variable takes for a single execution of the statement. We do this with the syntax $\texttt{variable} = \texttt{expression} \rightarrow \texttt{value}$. For instance, $x \sim \texttt{gaussian}(0, 1) \rightarrow 0.132$.
+% Note that this value may not be constant over repeated executions.
+Unlike most prior PPLs, our program does not include an explicit \texttt{observe} statement. Rather the values annotated on the right side of each arrow is the observation for the variable in the statement.
+Given a probabilistic program, execute it and annotate each line with assignments. Next, for each line, randomly mask the assignment with some probability. In other words, $x \sim \texttt{gaussian}(0, 1) \rightarrow \texttt{<mask>}$. Save this masked program and the true assignments for all masked variables as a single data point. To generate a dataset, we loop this procedure until we have a sufficiently large corpus.  Since the masking decision is made independently for each line, we can theoretically generate every possible permutation of observed and latent variables.
+
+\subsubsection{Objective}
+
+The dataset of programs as described is not far from a natural language corpus used by BERT. If we could use it to teach a model to unmask assignments of latent variables, then that is tantamount to inference. We formalize this intuition into a procedure we call \textit{masked language inference}, or MLI. See Fig.~\ref{fig:overview} for an overview.
+The objective for MLI is a sum of two loss functions: one for traditional MLM and the other to score the true assignment for a latent variable under a posterior distribution parameterized by a neural network. In more detail, given a program $x = (t_1, \ldots t_n)$, we make two versions: for the first $x_{\textup{mlm}}$, we do what MLM typically does, choosing random tokens in the program string to mask; for the second, $x_{\textup{inf}}$, we do as described above and randomly mask assignments (the values to the right of the $\rightarrow$ symbol per line). Note that the two inputs $x_{\textup{mlm}}$ and $x_{\textup{inf}}$ have different tokens masked.
+
+We use a transformer network $f_\theta: X \rightarrow \mathbf{R}^d$ that takes a raw string as input where $\theta$ are trainable parameters. We compute $v_{\textup{mlm}} = f_\theta(x_{\textup{mlm}})$ and $v_{\textup{inf}} = f_\theta(x_{\textup{inf}})$, both of which are a sequence of contextual vector embeddings $v = (v_1, \ldots v_n)$, one for each token. For each masked index $i$, we perform two actions, one for each input. For MLM, we have a classification head $g_\theta: \mathbf{R}^d \rightarrow |V|$ (e.g. a linear layer) that maps a vector $v_{\textup{mlm}}[i]$ to a probability for each token in the vocabulary $V$. For inference, we have an \textit{inference head} $h_\theta: \mathbf{R}^d \rightarrow \mathcal{Q}$ that maps a vector $v_{\textup{inf}}[i]$ to an approximate posterior distribution $q(t_i|x_{\text{inf}})$ in the family $\mathcal{Q}$ for the latent variable corresponding to token $t_i$.
+For continuous variables, a common choice for $\mathcal{Q}$ is the Gaussian family, in which the network $h_\theta$ would return two vectors representing the mean and standard deviation. Alternatively, if the latent variable is binary, we might choose the family $\mathcal{Q}$ to be Bernoulli where $h_\theta$ returns a probability vector. The choice of distribution is flexible as long as scoring is differentiable (though sampling need not be).
+% The choice of what distribution to use is left to the practitioner: if the chosen distribution is not the same as the true posterior (which may not have a closed form), then this is approximate inference. Unlike the motivational observation at the start of this section, this inference head is not unmasking a single value. Rather it is inferring the parameters of an approximating posterior, meaning we are not just doing maximum a posteriori.
+In summary, the MLI objective is:
+\begin{equation}
+\mathcal{L}_{\textup{mli}}(\theta) = \mathbf{E}_{(x_{\textup{mlm}}, x_{\textup{inf}}) \sim p(x)}\left[ \log p(t_{\textup{mlm}} | x_{\textup{mlm}}) + \alpha \cdot \log p(t_{\textup{inf}} | x_{\textup{inf}}) \right]
+\label{eq:mli}
+\end{equation}
+where $\alpha$ is a weight balancing the two losses, and $t_{\textup{mlm}}, t_{\textup{inf}}$ are masked tokens. While Equation~\ref{eq:mli} only masked a single token per loss, in practice we randomly mask 15\% of tokens in $x_{\textup{mlm}}$, and mask 15\% of assignments in $x_{\textup{inf}}$. This can be maximized with stochastic gradient descent.
+
+\subsubsection{Empirical Analysis}
+\label{sec:toyexpt}
+
+To build intuition and demonstrate efficacy, we consider six probabilistic programs used in prior work \cite{che2021meta}. These programs implement popular models like Gaussian mixture models, hierarchical latent variable models, astronomical models, and incorporate library imports like the Rosenbrock function whose code is not specified in the program.
+We recommend the reader refer to Section~\ref{sec:app:mli} for details. While these programs are simple, they specify wide prior distributions that result in high sample diversity over repeated executions, which should make the MLI task more challenging.
+
+\begin{table}[t!]
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+Program & \multicolumn{2}{c}{Test Set Evaluation} & \multicolumn{2}{c}{Ablation: No MLM} \\
+& $\log p(z|x)$ & $\text{var}\left\{\log \frac{p(x,z)}{q(z|x)}\right\}$ & $\log p(z|x)$ & $\text{var}\left\{\log \frac{p(x,z)}{q(z|x)}\right\}$ \\
+\midrule
+Latent & $-1.538${\tiny$\pm 0.1$} & $1.895${\tiny$\pm 1.1$} &$-3.740${\tiny$\pm 0.2$} & $1.059$e$4${\tiny$\pm 91$} \\
+Clustering & $-3.406${\tiny$\pm 0.4$} & $1.097${\tiny$\pm 0.6$} &  $-8.037${\tiny$\pm 3.1$} & $5.415$e$3${\tiny$\pm 5$e$3$} \\
+Hierarchical & $-3.268${\tiny$\pm 0.1$} & $119.2${\tiny$\pm 60$} & $-7.088${\tiny$\pm 0.8$} & $5.162$e$9${\tiny$\pm 2$e$9$} \\
+Multi-level & $-3.359${\tiny$\pm 0.5$} & $131.3${\tiny$\pm 31$} & $-8.363${\tiny$\pm 0.7$} & $3.219$e$8${\tiny$\pm 2$e$8$} \\
+Milky way & $-2.896${\tiny$\pm 0.2$} & $66.09${\tiny$\pm 44$}& $-5.619${\tiny$\pm 0.2$} & $1.147$e$6${\tiny$\pm 1$e$6$} \\
+Rosenbrock & $-1.827${\tiny$\pm 0.1$} & $6.673${\tiny$\pm 3.9$} & $-4.505${\tiny$\pm 0.1$} & $4.252$e$5${\tiny$\pm 2$e$5$} \\
+\bottomrule
+\end{tabular}
+\caption{Masked Language Inference on a suite of  probabilistic programs. For each program, a test set is built using 1\,000 new executions with randomly masked assignments. We measure the average quality of inferring these masked values. We show averages over 3 runs.}
+\label{tab:toy}
+\end{table}
+
+\paragraph{Evaluation Metrics}  We build a test set with 1,000 new executions of the program not used in training and randomly mask assignments. This set is held constant across runs and ablations. We evaluate performance with two metrics. First, we compute log probability of unmasked assignment under the approximate posterior specified by the model, averaged over all masked tokens per execution and all test executions. The larger this value is, the better the inference.
+
+Second, we compute the variance of the log importance weights (IW), as in \cite{wu2018multimodal}. Since the approximate posterior $q$ acts as an importance distribution estimating the true posterior, we measure the quality by the variance of $\frac{p(x,z)}{q(z|x)}$, where lower variance is more desirable. If $q(z|x) = p(z|x)$, the importance weight would be a fixed constant, meaning zero variance.
+
+%\begin{SCfigure}[h!]
+\begin{figure}[h!]
+  \centering
+  \begin{subfigure}[b]{0.24\textwidth}
+    \centering
+    \includegraphics[width=0.45\textwidth]{images/chapter6/graph/indgauss.pdf}
+    \caption{}
+  \end{subfigure}
+%  \hfill
+  \begin{subfigure}[b]{0.24\textwidth}
+    \centering
+    \includegraphics[width=0.5\textwidth]{images/chapter6/graph/condind.pdf}
+    \caption{}
+  \end{subfigure}
+%  \hfill
+  \begin{subfigure}[b]{0.24\textwidth}
+    \centering
+    \includegraphics[width=0.5\textwidth]{images/chapter6/graph/expaway1.pdf}
+    \caption{}
+  \end{subfigure}
+%  \hfill
+  \begin{subfigure}[b]{0.24\textwidth}
+    \centering
+    \includegraphics[width=0.5\textwidth]{images/chapter6/graph/expaway2.pdf}
+    \caption{}
+  \end{subfigure}
+\caption{Graphical model representations for the `Independent Gaussians' (a), `Conditional Independence' (b), and `Common Effect' (c,d) programs.}
+\label{fig:graph}
+\end{figure}
+
+\paragraph{Results} Table~\ref{tab:toy} reports the performance on the six programs. We observe large probabilities (log close to 0) and small variance of log IW, which suggests good generalization of inference to new sample values. As a baseline, we include an ablation to MLI by removing the MLM term, which amounts to training the inference head only. We find smaller log probabilities (every log point is a significant difference) and much larger variance. Together, this suggests that the MLM term is important for generalization, likely as it helps the neural network understand program structure.
+% That is, MLM regularizes the network to not overfit to memorizing the training examples.
+For analysis on the distribution of variances, see Section~\ref{sec:app:mli}.
+
+\subsection{Visualizing Attention Maps}
+
+Prior works \cite{binder2016layer,voita2019analyzing,abnar2020quantifying,chefer2021transformer} using transformer networks in natural language have re-purposed the attention weights in the later layers as an mechanism to introspect model logic. In a similar vein, we leverage attention weights to approximate a dependency graph between random variables in the problem.
+
+\paragraph{Datasets} We study simple probabilistic programs that exhibit independence and conditional independence between random variables. First, in Figure~\ref{fig:graph}(a), $z_1$ and $y_1$ are two independent Gaussian variables. We should expect independence between the sets $\{y_1, y_2\}$ and $\{z_1, z_2\}$. Second, in Figure~\ref{fig:graph}(b), we design a graphical model with a Bernoulli random variable $z$, and pick $a$ and $b$ using \texttt{if} statements to be conditionally independent given $z$. We add two Gaussian variables $x$ and $y$ that independently add noise around $a$ and $b$, i.e. $x \sim \mathcal{N}(a, 1)$. Finally, in Figure~\ref{fig:graph}(c,d), we create a common effect model with two potential causes: choose $x$ and $y$ to be independent Bernoulli variables, and set $z$ to be $1$ if $x \texttt{ or } y$ else $0$. We expect $p(x|z, y)$ to differ meaningfully from $p(x|z)$.
+% Refer to Appendix for more details.
+% For random variables with binary outcomes, we parameterize the inference head to output a single vector representing the weight of a Bernoulli distribution. Since we only need to score samples in the MLI objective (and not sample), this remains fully differentiable.
+
+\begin{figure}[tbh]
+  \centering
+  \begin{subfigure}[b]{0.30\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{images/chapter6/heatmap/indgauss.pdf}
+    \caption{}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.30\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{images/chapter6/heatmap/condind.pdf}
+    \caption{}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.30\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{images/chapter6/heatmap/expaway.pdf}
+    \caption{}
+  \end{subfigure}
+\caption{Heatmaps of attention norms for `Independent Gaussians', `Conditional Independence', and `Common Effect' programs. On the y axis, we show which variable has its assignment masked. On the x axis, we list all program variables. The brighter the color, the larger the weight.}
+\label{fig:heatmap}
+\end{figure}
+
+\paragraph{Results} We report metrics similar to Table~\ref{tab:toy} for these programs in Section~\ref{sec:app:viz}. Here, we instead visualize attention: Suppose a single assignment in a program is masked. We first compute the L$_2$ norm over contextual vectors from the last layer for all tokens in the program. Next, we segment the norm sequence by program line, and compute the average norm per segment. Since each line is associated with a variable declaration, we can treat the average norm for a line as the ``attention'' the network is paying to this variable when inferring the masked variable. We hypothesize that this measure will be correlated to the dependency between the two variables.
+
+Figure~\ref{fig:heatmap} shows the heatmap of attention norms for the three programs. For subplots (a) and (b), we mask each variable's assignment one at a time. The y-axis shows which variable is masked. In the `Independent Gaussians` program, the model approximates the independence between $\{z_1, z_2\}$ and $\{y_1, y_2\}$. For instance, in the first row of (a), when unmasking $y_1$, we see the network upweights the tokens corresponding to $y_1$ and $y_2$, but downweights the tokens for $z_1$ and $z_2$. The remaining rows show a consistent pattern. While it may seem peculiar at first for the model to pay attention to $y_1$ when unmasking $y_1$, we note that this is important for the model to understand what kind of variable $y_1$ is. Similarly, in the `Conditional Independence` program, the model approximates the independence between $\{a,x\}$ and $\{b, y\}$ given $z$. Looking at the first row, we see that unmasking $a$ focuses on variables $x$ and $z$ and downweights $b$ and $y$.
+% We also highlight the last row: if we instead mask $z$, the model pays almost equal attention to all the other variables, with some emphasis on $a$ and $b$ as they are more directly related to $z$.
+Finally, in subplot (c), the y-axis shows which variables are observed rather than which are masked, for clarity. The bottom row plots attention weights if we observe both $z$ and $y$ whereas in the top row, we only observe $z$. We see a stark contrast: in the bottom, the weights are roughly uniform; on top, the model gives little weight to $y$ to unmask $x$. 
+% One interpretation is that observing $y$ (and $z$) determines the cause of the effect $z$. Thus, the network pays more attention to $y$ when observed. Without knowing $y$, the network can only rely on $z$.
+% As the name of the program belies, this is reminiscent of the \textit{explaining away} phenomena, where observing a competing cause $y$ effects my belief of the current cause $x$ invoking the result $z$.
+
+\section{Meta-Amortized Inference}
+\label{sec:meta}
+
+Rather than restrict to a single program, we wish to use MLI to do \textit{meta-amortized inference}, or zero-shot inference across programs.
+% Interestingly, we note that the toy experiments in Section~\ref{sec:toyexpt} are already performing a simplified version of meta-amortization as the dataset is varying which variables are observed, not just the observation values. In this section, we study a more difficult variation:
+Given a dataset of programs for training, how well can we do inference out-of-the-box for a new, unseen program? We assume this novel program is within the same meta-distribution as the training set of programs; otherwise the problem is unsolvable.
+
+\subsection{Program Augmentations}
+
+From prior work \cite{gordon2018meta,choi2019meta,che2021meta}, we know that the meta-training set must be crafted carefully for meta-amortized inference to perform well: the model must see enough programs that `span' the program space to be able to generalize to new programs from the meta-distribution. Collecting such a dataset for probabilistic programs is unfeasible. Instead, we propose a set of \textit{program augmentations}, inspired by data augmentations, to enlarge a small set of programs. The hope is that the larger dataset provides enough coverage to generalize to a new test program.
+We propose the following augmentations, which can be recursively stacked on another:
+
+\paragraph{Fuzz Function} Replaces a primitive function or distribution with a randomly sampled function or distribution. Replacements are constrained to have the same number of arguments as the original function. For example, the program $z = \texttt{rosenbrock}(a, b)$ might be augmented to $z \sim \mathcal{N}(a, b)$.
+
+\paragraph{Fuzz Constant} Constants are replaced by newly sampled constants from known prior distributions. For example, $r \sim \mathcal{N}(0, 1)$ becomes $r \sim \mathcal{N}(0.1, 0.9)$.
+
+\paragraph{Line Swaps} Swaps two independent program lines such that the dependency graph between random variables is unchanged. For example, a program with three lines $u \sim \mathcal{N}(0, 1); v \sim \mathcal{N}(1, 1); r = u + v$ could be augmented to $v \sim \mathcal{N}(1, 1); u \sim \mathcal{N}(0, 1); r = u + v$ but it would not be possible to swap the third line with any other given the dependency of $u$ and $v$ on $r$.
+
+\paragraph{Cut and Glue} Replace the usage of a variable with another variable already defined in the program. Note that this augmentation changes the dependency graph. For example, $u = a + b; v = \texttt{sqrt}(u)$ could become $u = a + b; v = \texttt{sqrt}(b)$ where $b$ is defined earlier in the program.
+
+\paragraph{Create and Use} Creates a new random variable and uses it in lieu of another variable or constant in the right-hand side of an expression. Note that this augmentation introduces a new random variable. For example, $u = a + b; v = \texttt{sqrt}(u)$ could become $u = a + b; r \sim \mathcal{N}(0, 1); v = \texttt{sqrt}(r)$.
+
+Given that many of these augmentations meaningfully change the program by removing, editing or adding random variables, repeated applications of random augmentations can create novel programs in structure and content. In practice, not all augmentations when compounded result in legitimate programs. For instance, the augmentation $\texttt{rosenbrock}(1, -1) \rightarrow N(1, -1)$ by \textbf{fuzz function} is ill-defined. We perform rejection sampling and discard improper programs.
+
+\subsubsection{Empirical Analysis}
+\label{sec:toyexpt2}
+
+To test program augmentations, we revisit the six  programs from Section~\ref{sec:toyexpt}. However, now we use five of them for meta-training, and hold out the ``Rosenbrock'' program for meta-test. We apply up to five random program augmentations to each program in both sets to create the training and test splits. Note that the test inputs are all derived from a novel program unseen by the model in training.
+% We also note that the set of variables that are latent versus observed vary across augmentations of the same program.
+This is a much more difficult generalization problem than prior experiments. As an important caveat, we assume knowledge of which external functions might be used. In the `Rosenbrock' program, we use the \texttt{rosenbrock} external function. We assume access to this when augmenting programs in the meta-training set such that \texttt{rosenbrock} may appear in training programs.
+% While test programs can have novel structure and variables, they will not have novel functions.
+
+\begin{table}[b!]
+\centering
+\small
+\begin{tabular}{lcc}
+\toprule
+Model & \multicolumn{2}{c}{Test Set Evaluation} \\
+& $\log p(z|x)$ & $\text{var}\left\{\log \frac{p(x,z)}{q(z|x)}\right\}$ \\
+\midrule
+MLI & $-8.160$ {\tiny $\pm 4.5$} & $15.10$ {\tiny $\pm 9.6$ } \\
+MLI - Augmentations & $-246.6${\tiny $\pm 98$} & $355.9$ {\tiny $\pm 37$} \\
+MLI + Finetuning & $-5.727$ {\tiny $\pm 4.0$} & $16.06$ {\tiny $\pm 7.2$} \\
+Random + Finetuning & $-42.54$ {\tiny $\pm 89$} & $784.9$ {\tiny $\pm 242$}  \\
+\bottomrule
+\end{tabular}
+\caption{Meta-Amortized Masked Language Inference over a suite of probabilistic programs. A test set of 1,000 programs are constructed using random augmentations on a held-out program.}
+% Results are averaged over 3 runs. Two ablations measure the effect of augmentations and variational fine-tuning.}
+\label{tab:toy:augment}
+\end{table}
+
+\paragraph{Results} We report results in Table~\ref{tab:toy:augment}. The top row shows the log likelihood and the variance of importance weights for MLI. The second row shows an ablation without augmentations (where we generate a dataset of equivalent size by re-executing programs as we did in Section~\ref{sec:toyexpt}). We observe a 100x improvement with augmentations, suggesting better generalization to unseen programs.
+
+\section{Variational Finetuning}
+\label{sec:finetune}
+
+So far we have only studied ``zero-shot'' inference where an amortized inference model, given a new program, must do inference without any new computational expense. In more realistic scenarios, where test programs can look quite different than the training set, obtaining high quality inference in a zero-shot manner can be challenging. In this case, we propose to finetune our pretrained inference model using stochastic variational inference, or SVI \cite{hoffman2013stochastic,ranganath2014black,kucukelbir2017automatic}.
+
+More specifically, fix a test program $x^*$ that we would like to do more high quality inference for. Suppose $x^*$ has $n$ observed data points $d_1, \ldots, d_n$, and $m$ latent variables we want to estimate $z_1, \ldots z_m$. Further, we are given $\hat{\theta}$, the parameters obtained from optimizing MLI on a pretraining dataset of programs. Since the composed functions $f \cdot h: X \rightarrow \mathcal{Q}$ map a probabilistic program to an approximate posterior, we define the shorthand $q_{\hat{\theta}}(z_{1:m}|d_{1:n}) = h(f(x^*))$.
+% This notation is similar to description of the supervised regressor for amortized inference in Section~\ref{sec:background}.
+
+We can optimize the evidence lower bound, which we recall is:
+\begin{equation}
+  \theta^* = \arg\max_{\theta \in \Theta} \mathcal{L}_{\textup{elbo}}(\theta) = \arg\max_{\theta \in \Theta} \mathbf{E}_{z_{1:m} \sim q_{\theta}(z_{1:m}|d_{1:n})} \left[\log \frac{p(d_{1:n}, z_{1:m})}{q_\theta(z_{1:m}|d_{1:n})}\right]
+  \label{eq:elbo:finetune}
+\end{equation}
+Since we are not amortizing over programs in this finetuning step, Equation~\ref{eq:elbo:finetune} does not contain a second expectation over programs. That is, $z_{1:m}$, $d_{1:n}$ are the specific variables from $x^*$.
+We initialize $\theta = \hat{\theta}$ to leverage pretrained weights. Note $p(\ldots)$ has no trainable parameters but acts as a likelihood scaling term for different values of $z_{1:m}$ and thus, cannot be dropped.
+
+\paragraph{Results} In Table~\ref{tab:toy:augment}, we include an ablation  comparing the generalization of inference with and without fine-tuning. We fine-tune the inference network (from MLI pretraining), optimizing Equation~\ref{eq:elbo:finetune} separately for each program for 1,000 iterations. As a baseline, we also finetune the network from a random initialization. We observe that fine-tuning MLI further improves log probability by roughly 2 log points with comparable IW variance. On the other hand, fine-tuning from scratch results in poor performance, highlighting the importance of pretraining.
+
+\subsection{Plating} In many applications of probabilistic inference, we have a dataset of observations that can be thousands of entries or more. We would like to make inference queries given all entries but naive unrolling is unscalable. 
+%Transformers like BERT cannot handle arbitrarily long input sequences. 
+Instead, we extend MLI to support `for' loops over conditionally independent variables. To do so, we will implement a form of \textit{minibatching} in our inference algorithm.
+
+Figure~\ref{fig:plating} shows such a plating example. In the left program, we see 10 observations $d_1, \ldots, d_{10}$ such that $d_i \sim \texttt{gaussian}(x, 1)$ where $x$ is outside of the plate. But suppose 10 examples are too many to unroll. In the program on the right, we replace the `for' loop with a \texttt{plate(n)} token where the argument $n$ specifies the number of total iterations. Within the plate, we unroll two randomly subsampled iterations $i \in \{1, 4\}$. For multiple executions of this program, the iterations within the plate change, just like minibatching in neural network training. From the perspective of the transformer, this change does nothing more than add a new token to the vocabulary.
+
+\begin{figure}[h!]
+  \centering
+  \includegraphics[width=0.5\textwidth]{images/chapter6/plating_process.png}
+  \caption{Example of plating within MLI. There is a special \texttt{plate} token that specifies the total number of  observations, $n$. This defines a scope with a minibatch of $k \ll n$ observations.}
+  \label{fig:plating}
+\end{figure}
+
+\paragraph{Why does this work?} Consider computing the program density $p(x, d_1, \ldots, d_n)$. This can be rewritten as $p(x)p(d_1, \ldots, d_n|x)$ of which the first term is a given. To compute the second term, observe that $d_1, \ldots, d_n$  are conditionally independent on $x$. So, $p(d_{1:n} | x) = \prod_{i=1}^n p(d_i | x)$. Now:
+\begin{equation}
+\log p(d_{1:n} | x) = \sum_{i=1}^n \log p(d_i|x) \approx \frac{n}{k} \sum_{j \in \textup{minibatch}} \log p(d_j|x)
+\label{eq:minibatch}
+\end{equation}
+where the minibatch is of size $k \ll n$. We can make an unbiased (but higher variance) estimate of the full conditional distribution (and hence, the program density) using a small minibatch.
+% This is a toy example but as long as the variables defined within the plate are independent over iterations, the program density can always be decomposed into a form akin to the one above.
+
+% Given the minibatching trick in Equation~\ref{eq:minibatch}, we can compute $p(d_{1:n}, \{x\}) = p(d_{1:n} | x)p(x)$ where $p(x)$ is a known prior. Following this, we can optimize Equation~\ref{eq:elbo:finetune} to perform finetuning.
+In the Appendix (Section~\ref{sec:app:irt}), we demonstrate plating on an item response theory (IRT) \cite{edgeworth1888statistics,hambleton1991fundamentals,rasch1993probabilistic,wu2020variational,wu2021modeling} model, a popular probabilistic program. In the next section, we will leverage plating use MLI on a bank of real world probabilistic programs with thousands of observations each.
+
+\section{Foundation Posterior}
+\label{sec:stan}
+
+The relationship between MLI and variational fine-tuning is reminiscent of pretraining and downstream tasks, as popularized by self-supervised learning \cite{devlin2018bert,chen2020simple}. Inspired by foundation models \cite{bommasani2021opportunities}, we propose to frame the result of MLI as a \textit{foundation posterior} that can be finetuned downstream using SVI to perform inference for a wide array of probabilistic programs. The goal is to pay a large one-time cost in training a ``general'' inference model which may not be adequate for inference in all settings, but can be quickly adapted to new datasets with low cost.
+To demonstrate the foundation posterior, we meta-amortize inference over a set of standard Stan \cite{carpenter2017stan} programs from PosteriorDB \cite{magnusson2021}, a benchmark dataset for evaluating  inference algorithms \cite{baudart2021compiling,baudart2021automatic,yao2020stacking,zhang2021pathfinder,durr2022bernstein}.
+% PosteriorDB contains 49 programs in the Stan language, which we manually convert to the notation presented in the paper.
+
+\paragraph{Setup} We hold out three programs from PosterioDB for evaluation, and optimize the foundation posterior on the remaining set. (Programs containing HMMs were removed as we are currently unable to support that graph structure.) Plating with minibatches of size 5 is used for all programs to fit observations within the transformer's 512 token limit. After pretraining, we optimize Equation~\ref{eq:minibatch} for each test program individually, varying the number of steps of fine-tuning across 0 (zero-shot), 10, 100, and 1000. As baselines, we use \texttt{CmdStanPy} to run Stan-native NUTS and ADVI. For NUTS, we vary the number of mixing steps between 10 and 10k; for ADVI we vary the number of iterations between 100 and 1M. Each program comes with 10k pre-computed posterior samples fit using long runs of expert-tuned NUTS in Stan, constituting the gold standard. To evaluate inference quality we draw 10k samples and perform a hypothesis test between the gold and drawn samples. If the p-value is high, we conclude the two sets of samples are likely from the same distribution.
+
+\begin{figure}[h!]
+  \centering
+  \begin{subfigure}[b]{0.32\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{images/chapter6/stan/earnings_logearn_height.pdf}
+    \caption{Earnings}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.32\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{images/chapter6/stan/kidiq_kidscore_interaction.pdf}
+    \caption{KidIQ}
+  \end{subfigure}
+  \hfill
+  \begin{subfigure}[b]{0.32\textwidth}
+    \centering
+    \includegraphics[width=\textwidth]{images/chapter6/stan/nes1976_nes.pdf}
+    \caption{NES1976}
+  \end{subfigure}
+\caption{Comparisons of MLI to native inference methods in the Stan programming language, such as NUTS or ADVI. For any inference algorithm, we draw samples from the posterior and compute similarity to ground-truth posterior samples through a Kolmogorov-Smirnov test.}
+\label{fig:stan}
+\end{figure}
+
+\paragraph{Results} Figure~\ref{fig:stan} reports results on held-out Stan programs. We plot the cost of inference computation (wall-clock time) on the x-axis in log-seconds. For MLI, we sum the cost of fine-tuning and the cost of forward passes to sample. For NUTS and ADVI, we ignore the cost of compilation, measuring mixing time and optimization time, respectively.
+On the y-axis, we plot the p-value.
+A better inference algorithm would bias towards the top left corner, achieving a higher p-value at lower cost. Each point in the plot represents a setting -- we redo inference with different finetuning steps or mixing steps, etc. Each line groups together a single inference algorithm.
+
+First, observe that ADVI in Stan performs poorly (p-value < 0.5) despite being cheap. In the KidIQ program, it is unable to surpass a p-value of 0, suggesting poor posterior samples. Second, we see that NUTS is computationally expensive but converges to a p-value of 1 in all cases, as expected since the gold samples are derived from NUTS. We observe foundation posterior to achieve a compromise between the two: it is cheaper than HMC but achieves higher inference quality than ADVI in Stan. The left-most point in the MLI curve represents zero-shot inference, which we find comparable to ADVI despite the latter training for up to 1M steps. Finally, the gray line shows an additional baseline where we finetune a transformer from scratch. We observe that initializing from a foundation posterior is critical to good inference.
+ % as finetuning from scratch results in p-value 0.
+
+\section{Related Work}
+\label{sec:related}
+
+% There is a rich history of literature improving  posterior inference algorithms like MCMC or HMC, such as learning proposal distributions \cite{andrieu2008tutorial} or more efficient hyperparameter tuning \cite{hoffman2014no}. We view our approach as an orthogonal contribution that can be used together with these approaches. For instance, future work could explore using foundation posteriors as proposals for faster convergence in MCMC and HMC mixing. In this paper, we focus more on stochastic variational inference \cite{jordan1999introduction,ranganath2014black} that rely on neural networks to define approximate inference distributions, which we discuss next.
+
+\paragraph{Amortized Inference} Traditionally, an inference query $q(z)$ is solved for a single assignment of the observed variable $x$. However, in many applications, we may be interested in solving the same inference query for many observations $x_1, x_2, \ldots, x_n$. Re-solving the same inference query from scratch for all $n$ related queries seems wasteful. Amortized inference \cite{gershman2014amortized,stuhlmuller2013learning} was proposed as a more efficient alternative by learning a function $q(z|x)$ that maps a observed assignment $x$ to a distribution over the latent variable $z$. In doing so, we ``amortize'' the cost of inference with a large one-time cost in defining $q$, after which an inference query can be solved with a single function application. Without amortization, the foundation posterior would not be a very efficient inference algorithm.
+
+% \textbf{Compiled Inference}$\quad$ In some applications, we may be given a generative model that we need not learn from data. For instance, a probabilistic program specifies a hand-written generative model: executing the model forward maps latents to observations. In these cases, we can optimize a reduction of the evidence lower bound \cite{kingma2013auto,rezende2014stochastic}: the likelihood term drops from the expression, leaving a supervised objective matching latents to observations. This algorithm is called ``compiled'' inference \cite{le2017inference}. We note that masked language inference is a special case of compiled inference.
+% In our experiments, we measure the benefit of meta-amortized inference with compiled inference as a baseline.
+
+\paragraph{Meta-Inference} Meta-learning has been used to do inference amortized over both queries and a family of generative models \cite{choi2019meta,gordon2018meta,iakovleva2020meta}. These works have shown that ``meta-amortized'' inference can generalize well within the family of models it was trained on, even members not explicitly seen in training. The foundation posterior is a meta-amortized algorithm trained with masked language inference. Unlike prior works, we not only evaluate zero-shot inference but also the ability to serve as an effective starting point for further fine-tuning.
+
+\begin{figure}[h!]
+  % \begin{subfigure}[b]{0.49\linewidth}
+  %   \begin{center}
+  %     \includegraphics[width=0.9\linewidth]{mh/accept.pdf}
+  %   \end{center}
+  % \end{subfigure}
+  \begin{center}
+  \includegraphics[width=0.7\linewidth]{images/chapter6/mh/rhat.pdf}
+  \end{center}
+  \caption{Distribution of R-hat scores over 100 executions of the `Latent' program when using the approximate posterior (red) versus the prior (orange). Averages are the dotted lines.}
+  \label{fig:mh:accept}
+\end{figure}
+
+Most relevant to our work is a meta-learning approach \cite{che2021meta} that builds a white-box inference algorithm by matching every step in a probabilistic program with neural network whose role is to ``invert'' it. Foundation posteriors trade explainability for flexibility. Our approach is not white-box: inference is performed by a single black box neural network. In return, our approach assumes no structure: it treats the program as nothing more than a  string, making its generalization capacity greater than the approach in \cite{che2021meta}. We view these two methods as optimizing for distinct properties.
+
+\paragraph{Foundation Models} Foundation models \cite{bommasani2021opportunities} are a blanket term for large unsupervised models that map data to representations. Examples include ResNet \cite{he2016deep} in computer vision, BERT \cite{devlin2018bert} and GPT \cite{brown2020language,radford2019language} in natural language, Wav2Vec \cite{schneider2019wav2vec,baevski2020wav2vec} in speech, and CLIP \cite{radford2021learning} and Data2Vec \cite{baevski2022data2vec} in multimodal applications. Foundation models are treated as frozen backbones whereupon a small portion is finetuned  for a downstream task. Our motivation for the foundation posterior is precisely this: learn a good posterior ``initialization'' that can be quickly finetuned for  downstream inference.
+
+\section{Discussion}
+\label{sec:discussion}
+
+% We discuss important limitations, summarize findings, and present future directions for research.
+
+\paragraph{Limitations} First, optimizing  transformer networks is computationally costly, requiring accelerated hardware. For practitioners simply interested in a small set of inference queries, it is simpler to use MCMC or VI. Second, MLI as described is not sufficient for all programs: in PosteriorDB, classes of graphical models like HMMs are difficult to represent as text. Third, our approach, being reliant on deep learning, is limited in its explainability. In the case that inference fails, we are unable to reason about the root cause. Finally, the success of foundation models \cite{bommasani2021opportunities} is largely predicated on large datasets with millions of entries. Unfortunately, we do not know of any large collections of probabilistic programs other than PosteriorDB, which in comparison, is of modest scale.
+% We would expect a foundation posterior optimized thousands to millions of programs would potentially be quite general.
+% Future work could compile such a dataset.
+% Almost all of the experiments presented assume continuous random variables, meaning we could model posteriors using Gaussian distributions. However, since MLI does not require sampling, we are not restricted to posterior families that are reparameterizable \cite{kingma2013auto,rezende2014stochastic}. For instance, like we did in Section~\ref{sec:app:viz}, we can specify discrete posteriors (e.g. Bernoulli or Categorical) for discrete random variables with finite support.
+
+\paragraph{Future Work} Future work could investigate foundation posteriors that act as proposal distributions for MCMC-based methods.
+% Moreover, as Bayesian networks are a subclass of probabilistic programs, future research could study applying foundation posteriors to BayesNet challenges.
+As a first step, we run Metropolis Hastings on one of the six toy programs, and compute R-hat \cite{gelman1992inference}. We achieve a score of $1.011$ ($\pm 0.009$ over 100 test programs) when using the foundation posterior as the proposal compared to $1.043$ ($\pm 0.059$) when using the prior distribution. Best practice deems a chain sufficiently mixed if R-hat is less than $1.05$. More analysis is needed to better understand the efficacy of foundation posteriors in this context.
+
+\paragraph{Summary} We proposed a meta-amortized inference algorithm for probabilistic programs using masked language modeling. With this algorithm, we build a foundation posterior capable of fast zero-shot inference that can also be finetuned for more accuracy.
+We are optimistic that the generality of the approach, despite its computational burden, can make for practical and scalable inference.

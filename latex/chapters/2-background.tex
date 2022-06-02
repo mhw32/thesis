@@ -1,0 +1,93 @@
+We provide necessary background on generative models and deep  inference. We will first present generative models in more formality, introduce latent variable models, describe the inference challenge, and characterize common inference algorithms and the families of generative models used in this thesis. More background to each method will be presented in the corresponding section.
+
+\section{Generative Models}
+
+Given an observed data point $x \in \mathbf{R}^d$, we assume that it is sampled from some underlying data distribution $p_{\text{data}}$. In this notation, $d$ represents the dimensionality, which can be quite high. We may also refer to $x$ as containing $d$ observed variables, with each dimension as its own random variable. For instance, in computer vision, $d$ may be represent the number of pixels in an image. In natural language, $d$ may represent the number of tokens in a vocabulary set. Critically, we do not know the form of $p_{\text{data}}$. Fortunately though, we assume access to a dataset of points i.i.d. sampled from $p_{\text{data}}$, which we write as $\mathcal{D} = \{ x : x \sim  p_{\text{data}}\}$. In a machine learning setting, we may also write this as $\mathcal{D}_{\text{train}}$ to explicitly denote a training split.
+
+Generative models are used to learn the true distribution $p_{\text{data}}$ given access only to $\mathcal{D}$. Since we do not know the form of $p_{\text{data}}$, we must make assumptions. In particular, we choose a family of models $\Theta$, where each model is defined by a set of parameters $\theta \in \Theta$ used to induce a probability distribution $p_\theta$. To ``learn'' a generative model, we wish to find the best set of parameters $\theta^*$ that minimizes a distance function between $p_{\text{data}}$ and $p_{\theta^*}$.
+
+The standard choice for distance is KL-divergence. In other words, we choose $\theta^*$ by minimizing the KL-divergence  between $p_{\text{data}}$ and $p_{\theta}$:
+\begin{equation}
+    \textup{KL}(p_{\text{data}}, p_{\theta}) = \mathbf{E}_{x \sim p_{\text{data}}}\left[ \log \frac{p_{\text{data}}(x)}{p_\theta(x)} \right] 
+    \label{eq:kl}
+\end{equation}
+We observe that Equation~\ref{eq:kl} can be divided into two terms: $ \mathbf{E}_{x \sim p_{\text{data}}}\left[ \log p_{\text{data}}(x) \right]$ and $ \mathbf{E}_{x \sim p_{\text{data}}}\left[ \log p_{\theta}(x) \right]$. Note that the first term is constant w.r.t $\theta$ and hence can be ignored when optimizing Equation~\ref{eq:kl}. Simplifying the expression, we obtain: 
+\begin{equation}
+    \min_{\theta \in \Theta} \textup{KL}(p_{\text{data}}, p_{\theta}) = \max_{\theta \in \Theta} \mathbf{E}_{x \sim p_{\text{data}}}\left[\log p_\theta(x) \right],
+    \label{eq:mle}
+\end{equation}
+the expected negative log-likelihood of samples from the data distribution, assigned by the model. That is, we are choosing parameters that maximize the likelihood (MLE) of true samples under the model.
+
+Given a generative model, we are interested in performing two actions. First, we may wish to \textit{sample} from the model distribution $x \sim p_\theta$. For instance, given a generative model over natural images, sampling equates to generating new images. Second, we may wish to do \textit{density estimation}: score the probability $p_\theta(x)$ assigned by the model to a single data point $x$. For a good generative model, $p_\theta(x) \approx p_{\text{data}}(x)$.
+
+\section{Latent Variable Models}
+
+As we increase the dimensionality of the observed data, it becomes more difficult to learn a traditional generative model. For one, the number of parameters we need to learn grows along with the size of possible models to search over. In real world applications, data dimensionality tends to be large, making this challenge an important one. If we naively treat each pixel in an image as an observed variable, a 2.0 megapixel camera would require roughly 1.9 million variables. 
+
+However, we might ask if all dimensions of an observed data need to be modeled separately? To continue the image example, nearby pixels are highly correlated random variables. Building on this intuition, we may enforce members of $\Theta$ to contain additional hidden (or latent) variables that we do not observe. We choose these latent variables to be lower dimensional, as their purpose is to model the ``common causes'' to correlated observed variables. The primary benefit of latent variables is a reduction in the number of parameters we need to learn: rather than model every dimension of the data, we only need to model the latent variables (a much smaller set) and a relationship between latent and observed variables. 
+
+To introduce notation, let $z \in \mathbf{R}^n$ represent a set of latent variables where $n < d$. A member of $\Theta$ now induces a joint distribution $p_\theta(x, z)$ over observed and latent variables. However, we can no longer do MLE since we have a type mismatch: our models induce a joint distribution, not the marginal $p_\theta(x)$ used in Equation~\ref{eq:mle}. To remedy this, we can use the law of total probability: 
+\begin{equation}
+    \mathbf{E}_{x \sim p_{\text{data}}}\left[\log p_\theta(x) \right] = \mathbf{E}_{x \sim p_{\text{data}}} \left[ \log \int_z p_\theta(x, z) dz \right]
+    \label{eq:marg}
+\end{equation}
+Equation~\ref{eq:marg} raises more questions than it answers. It contains a complex multi-dimensional integral that we cannot hope to evaluate in closed form. We will explain how to lower bound this expression in Section~\ref{sec:background:vi}. For now, you may it for granted that Equation~\ref{eq:marg} is efficient to evaluate and optimize.
+
+Recall in generative models, we were interested in sampling and density estimation. For a latent variable model, we introduce a third desiderata: given a data point $x$, we may wish to infer the corresponding latent variables $z$. More specifically, we are interested in the posterior distribution $p_\theta(z|x)$ which scores latent assignments conditioned on an observation. By the same logic as above, we note that the posterior is hard to evaluate in closed form since $p_\theta(z|x) = \frac{p_\theta(x,z)}{p_\theta(x)}$ requires solving an intractable integral. Many approaches have been proposed to both sample from and score using the posterior.  We call this challenge $\textit{inference}$, the focus of this thesis.
+
+\section{Inference Algorithms}
+\label{sec:background:inference}
+
+For very specific generative models with special graphical structure, we can perform \textit{exact inference} and exactly compute the posterior probabilities $p_\theta(z|x)$. If the relationship between latent and observed variables follows a chain, tree, or low treewidth graph, then variable elimination provides a worst-case exponential running time algorithm for inference. Special cases of variable elimination (e.g. the forward-backward algorithm) are common used for inference in hidden Markov models, a latent variable model for timeseries observations that follows a chain structure.
+
+However, these special generative models have limited applicability. In general, exact inference is NP-hard, reducing to a satisfiability problem. Therefore, \textit{approximate inference} algorithms are more commonly used in practice. Largely, there are two classes of approximate inference algorithms: Monte Carlo methods and variational methods. We briefly mention the former and will focus on the latter in Section~\ref{sec:background:vi}. The idea behind Monte Carlo (MC) methods is to sample from a known prior distribution and apply a sequence of operations to transform those to true samples from the posterior distribution. The most popular MC method for high-dimensional variables is Markov chain Monte Carlo (MCMC). Loosely, the idea of MCMC is to construct a Markov chain on a state space $\mathbb{R}^n$ whose stationary distribution is the posterior distribution of interest $p(z|x)$ where $z \in \mathbb{R}^n$. MCMC repeatedly performs a random walk over states such that transitions to a new state are rejected or accepted by a pre-defined algorithm. With some light assumptions, the fraction of time we spend in each state $z$ is proportional to $p(z|x)$. Sampling from $p(z|x)$ is then done by recording states from the chain. 
+
+The primary advantage of MCMC is a guarantee that samples generated from the process come from the true posterior. Unfortunately, this comes at several drawbacks: first, MCMC does not explicitly provide a form for the posterior meaning we cannot score samples; second, MCMC can be difficult to use as slow convergence rates and sample autocorrelation plague MCMC systems. Towards alleviating these difficulties, new methods like Hamiltonian Monte Carlo  \cite{neal2011mcmc,hoffman2014no} and the Wang and Landau algorithm \cite{wang2001efficient} have been proposed.
+
+\section{Variational Inference}
+\label{sec:background:vi}
+
+Alternatively, a second approach to approximate inference trades off guarantees for practicality. Fix a data point $x$. \textit{Variational inference} (VI) introduces a family of tractable distributions $\mathcal{Q}$. Each member $q_{\psi(x)} \in \mathcal{Q}$ is a probability distribution over the latent variables $z$. We wish to find the member $q_{\psi^*(x)} \in \mathcal{Q}$ that minimizes the KL-divergence between itself and the exact posterior distribution:
+\begin{equation}
+    q_{\psi^*(x)}(z) = \arg \min_{q_{\psi(x)}} \text{KL}(q_{\psi(x)}(z), p(z|x)).
+    \label{eq:background:vi}
+\end{equation}
+We call $q_{\psi^*(x)}$ the approximate posterior as it serves as a proxy for the true posterior. Since we do not know $p(z|x)$ apriori, we optimize the analogous objective in practice:
+\begin{equation}
+    \max_{\psi(x)} \mathbf{E}_{z \sim q_{\psi(x)}(z)} \left[\log \frac{p(x, z)}{q_{\psi(x)}(z)} \right]
+\end{equation}
+where $p(x)$ is dropped as its independent of $\psi(x)$.
+
+We note that Equation~\ref{eq:background:vi} depends on a specific value of the observed variables $x$, hence why the parameters $\psi$ are a function of $x$. The primary benefit of VI is the ability to view inference as an optimization problem: by minimizing Equation~\ref{eq:background:vi}, we obtain an  approximate posterior that we can use to both sample and score. However, the cost is that in general $q_{\psi^*(x)} \neq p(z|x)$, meaning there is approximation error. If the posterior is a multi-modal distribution, and $\mathcal{Q}$ is a family of Gaussian, we cannot hope to perfectly approximate. In VI, there is always this gap.
+
+Given multiple data points, we may wish to solve multiple inference queries (i.e. approximate $p(z|x)$) for different values of the observed variables $x$. As currently presented, we would need to solve an optimization problem for each value, which can quickly grow to be inefficient. Instead, we wish to \textit{amortize} inference \cite{gershman2014amortized} which casts the per-sample optimization problem as a supervised \textit{regression} task. Rather than solving for an optimal $q_{\psi^*(x)}$ for every data point $x$, we learn a single deterministic mapping $f_\phi: \mathbf{R}^d \rightarrow \mathcal{Q}$ to predict $\psi^*(x)$, or equivalently $q_{\psi^*(x)}$ as a function of $x$. Often we use the shorthand $q_\phi(z|x) = f_\phi(x)(z)$ when scoring a value for the latent variable $z$ under the approximate posterior.
+
+Amortization is not free as it introduces an \textit{amortization gap}: by sharing parameters $\phi$ over multiple queries, as opposed to optimizing for each example individually, the quality of inference may be lower for any single observation $x$. The tradeoff, however, is significant speedups: once the regression task is solved, computing the approximate posterior is a single function evaluation.
+
+It remains to be shown how to learn $\phi$. For this, we lower bound Equation~\ref{eq:marg}:
+\begin{equation}
+    \mathbf{E}_{x \sim p_{\text{data}}}\left[\log p(x) \right] \geq \mathbf{E}_{x \sim p_{\text{data}}}\left[\mathbf{E}_{z\sim q_\phi(z|x)}\left[\log \frac{p(x,z)}{q_\phi(z|x)}\right]\right]
+    \label{eq:elbo}
+\end{equation}
+using Jensen's inequality. The expression on the right-hand side is called the \textit{evidence lower bound}, or ELBO. Note that the equation uses $q_\phi$, amortizing inference.
+
+\section{Deep Inference}
+\label{sec:background:deepinf}
+In recent years, we have seen the growth of deep neural networks as general-purpose non-linear function approximators, achieving success on high-dimensional data \cite{lecun2015deep}. Neural networks can be optimized effectively using stochastic gradient-based optimization techniques \cite{ruder2016overview}. In Section~\ref{sec:background:vi}, we saw how variational inference can be framed as a regression problem using a function $f_\phi$ with parameters $\phi$. While we can choose $f_\phi$ to be a simple mapping e.g. linear regression, we can also choose it to be a deep neural network. Following this, we may optimize ELBO (Equation~\ref{eq:elbo}) with stochastic gradient descent (SGD) to find the optimal $\phi^*$. We can then view $q_\phi(z|x)$ as a \textit{deep inference model} as it is trained to map observations to approximate posteriors. In this paper, we may refer to the term \textit{deep inference} to describe exactly this process of utilizing deep neural networks to parameterize inference models.
+
+\section{Variational Autoencoder}
+
+Finally, we review the variational autoencoder (VAE), the amalgamation of the techniques covered so far. VAEs \cite{kingma2013auto,rezende2014stochastic} combine latent variable models with deep inference. There are two sets of parameters that are jointly learned: $\theta$ which parameterizes the generative model $p_\theta(x,z)$, and $\phi$ which parameterizes the inference model $q_\phi(z|x)$. The learning objective for a VAE is to maximize the ELBO where $p(x,z)$ is replaced with $p_\theta(x,z)$. Hence, optimization is done w.r.t. both $\theta$ and $\phi$. 
+
+To build intuition, we may rewrite the ELBO as
+\begin{equation}
+    \textup{ELBO}(\theta, \phi) = \mathbf{E}_{z \sim q_\phi(z|x)} \left[ \log p_\theta(x|z)\right] - \textup{KL}(q_\phi(z|x), p_\theta(z))
+    \label{eq:vae}
+\end{equation}
+where $p_\theta(z)$ is a (often parameter-less) prior distribution such as a standard Normal. Given its similarity to a vanilla autoencoder, we also call $p_\theta(x|z)$ a  decoder that ``decodes'' latents to observations and call $q_\phi(z|x)$ and encoder that ``encodes'' observations to latents. We can see Equation~\ref{eq:vae} is divided into two terms: the first is a \textit{reconstruction error} that encourages the decoding of an encoded input to resemble the original input. The second term is a \textit{regularizer} that pushes the approximate posterior to be close to the prior. Post-learning, we can use ancestral sampling $z \sim p_\theta(z); x \sim p_\theta(x|z = z)$ to sample from the generative model.
+
+Note that optimizing Equation~\ref{eq:vae} requires computing gradients through a sampling operation. While this is normally computationally difficult, if we choose the variational family $\mathcal{Q}$ to be Gaussian and the prior $p_\theta(z)$ to be a standard Normal, then we can leverage the \textit{reparameterization trick} \cite{kingma2013auto,rezende2014stochastic} to remove sampling from the gradient tape. The remainder is fully differentiable.
+
+\section{Summary}
+
+This concludes the background review. We presented the basics of generative models, latent variable models, approximate inference, variational inference, deep inference, and VAEs. In the following three parts, many of the methods presented will build upon this foundation. 

@@ -1,0 +1,100 @@
+\documentclass[12pt,letterpaper]{report}
+
+\usepackage{sisl-suthesis}
+\addbibresource{references}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{graphicx}
+\usepackage{subcaption} 
+\usepackage{epigraph}
+\usepackage[toc,page]{appendix}
+
+\newtheorem{thm}{Theorem}[section]
+\newtheorem{theorem}{Theorem}
+\newtheorem{lem}[thm]{Lemma}
+\newtheorem{corollary}{Corollary}
+\newtheorem{prop}[theorem]{Proposition}
+\newenvironment{sketch}{%
+  \renewcommand{\proofname}{Proof Sketch}\proof}{\endproof}
+
+\usepackage{hyperref}
+\hypersetup{colorlinks,
+%citecolor=blue
+}
+
+%% Thesis Metadata
+\dept{Computer Science}
+
+\title{Extensions and Applications of Deep Probabilistic \\ Inference for Generative Models}
+\author{Mike Hongfei Wu}
+
+% adviser and readers
+\principaladviser{Noah Goodman}
+\firstreader{Stefano Ermon}
+\secondreader{Chelsea Finn}
+
+\begin{document}
+
+\beforepreface
+
+\prefacesection{Abstract}
+\input{chapters/abstract}
+
+\prefacesection{Acknowledgments}
+\input{chapters/acknowledgements}
+\afterpreface
+
+\chapter{Introduction}
+\input{chapters/1-introduction}
+
+\chapter{Background}
+\label{chapter:background}
+\input{chapters/2-background}
+
+\part{Efficient and Scalable Inference}
+
+\chapter{Multimodal Generative Models}
+\label{chapter:mvae}
+\input{chapters/3-multimodal-vae}
+
+\chapter{Sample Efficiency in Deep Inference}
+\label{chapter:antivae}
+\input{chapters/4-antithetic-vae}
+
+\part{Inference for Inference}
+
+\chapter{Meta-Amortized Variational Inference}
+\label{chapter:metavae}
+\input{chapters/5-meta-vae}
+
+\chapter{A Foundation Posterior}
+\label{chapter:foundation}
+\input{chapters/6-foundation-posterior}
+
+\part{Real World Applications}
+
+\chapter{Item Response Theory}
+\label{chapter:vibo}
+\input{chapters/7-vibo}
+
+\chapter{Generative Grading}
+\label{chapter:ggnap}
+\input{chapters/8-ggnap}
+
+\chapter{Conclusions}
+\label{chapter:conclusion}
+\input{chapters/9-conclusion}
+
+\printbibliography
+
+\begin{appendices}
+    \chapter{Additional Proofs}
+    \label{chapter:appendix:proof}
+    \input{chapters/A-proofs}
+    
+    \chapter{Additional Results \& Details}
+    \label{chapter:appendix:results}
+    \input{chapters/A-results}
+\end{appendices}
+
+\end{document}

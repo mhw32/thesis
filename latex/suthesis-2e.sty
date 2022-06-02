@@ -348,7 +348,7 @@ smaller print.
 \else
     \def\@copyrightyear{\number\the\year}
 \fi
-\newif\ifcopyright \newif\iffigurespage \newif\iftablespage
+\newif\ifcopyright \newif\iffigurespage \newif\iftablespage 
 \newif\ifthesiscopyright
 
 
@@ -477,7 +477,7 @@ of Doctor of Philosophy.
 \begin{flushright}
 \begin{minipage}{5in}
 \parindent=0pt
-\hfill Approved for the Stanford University Committee on Graduate Studies
+Approved for the Stanford University Committee on Graduate Studies
 \par
 \vspace{\signaturespace}
 \hbox to 5in{\hfil\begin{tabular}{@{}l@{}}\vrule width 3in height
@@ -492,6 +492,10 @@ of Doctor of Philosophy.
 \def\thepage{}
 \thispagestyle{myheadings}
 \markboth{\rm \@author}{\rm \@author}\fi
+\begin{flushright}
+        \@author
+\end{flushright}
+\vspace{1em}
 \signature{(\@principaladviser)\quad Principal \advis@r}
   \vfill
 % if second principal advisor
@@ -521,6 +525,20 @@ of Doctor of Philosophy.
 \signaturepage
 }
 
+\usepackage{fancyhdr}
+
+%% small caps headers
+\RequirePackage{textcase} % provides \MakeTextUppercase and \MakeTextLowercase
+% \newcommand{\smallcaps}[1]{\smallcapsspacing{\MakeTextLowercase{#1}}}
+\newcommand{\smallcaps}[1]{\scshape\MakeLowercase{#1}}
+
+\newcommand{\forceheader}[1]{
+	\fancyhf{}%
+	\fancyhead[LE]{\thepage\quad\smallcaps{#1}}
+	\fancyhead[RO]{\smallcaps{#1}\quad\thepage}
+}
+
+
 \def\beforepreface{
         \pagenumbering{roman}
         \pagestyle{plain}
@@ -541,14 +559,32 @@ of Doctor of Philosophy.
 \def\afterpreface{\newpage
         \tableofcontents
         \iftablespage
-                \listoftables
+        \listoftables
         \fi
         \iffigurespage
-                \listoffigures
+        \listoffigures
         \fi
+        % \listofalgorithms
+        
         \cleardoublepage
         \pagenumbering{arabic}
-        \pagestyle{headings}}
+        \pagestyle{headings}   
+        \pagestyle{fancy} 
+        \fancyhf{}%
+	\renewcommand{\chaptermark}[1]{\markboth{\@chapapp\ \thechapter.\ ##1}{}}
+        \rhead{\smallcaps{\thepage}}
+        \lhead{\smallcaps{\leftmark}}
+        \renewcommand{\headrulewidth}{0pt}
+        % \fancyhead[LE]{\thepage\quad\textsc{\leftmark}}
+        % \fancyhead[RO]{\textsc{\rightmark}\quad\thepage}
+        % \fancyhf{}%
+	% \fancyhead[LE]{\thepage\quad\smallcaps{#1}}
+	% \fancyhead[RO]{\smallcaps{#1}\quad\thepage}
+        }
+
+
+
+
 
 % Redefine \thebibliography to go to a new page and put an entry in the
 % table of contents
